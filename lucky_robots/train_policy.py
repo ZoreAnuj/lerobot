@@ -1,57 +1,24 @@
+
 from pathlib import Path
 import torch
 import time
 import random
 import logging
-import argparse
 import torchvision.transforms as T
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.common.datasets.utils import dataset_to_policy_features
-from lerobot.common.policies.factory import make_policy
 from lerobot.common.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.common.policies.diffusion.modeling_diffusion import DiffusionPolicy
 from lerobot.configs.types import FeatureType
-from contextlib import nullcontext
-from torch.amp import GradScaler
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-class PolicyTrainer:
-    """Flexible policy trainer that supports multiple policy types"""
-    
-    def __init__(self, 
-                 repo_id, 
-                 policy_type="diffusion",
-                 device=None, 
-                 n_steps=5000, 
-                 batch_size=64,
-                 learning_rate=1e-4,
-                 grad_clip_norm=1.0,
-                 use_amp=False,
-                 log_freq=10, 
-                 max_retries=5, 
-                 retry_delay=10):
-        """
-        Initialize the policy trainer
-        
-        Args:
-            repo_id: The repository ID for the dataset
-            policy_type: Type of policy to train (diffusion, bc, etc.)
-            device: Training device
-            n_steps: Number of training steps
-            batch_size: Batch size for training
-            learning_rate: Learning rate for optimizer
-            grad_clip_norm: Gradient clipping norm
-            use_amp: Whether to use automatic mixed precision
-            log_freq: How often to log training progress
-            max_retries: Maximum number of retries for API rate limits
-            retry_delay: Delay between retries
-        """
+class TrainPolicy():
+    def __init__(self, repo_id, device=None, n_steps=5000, log_freq=1, max_retries=5, retry_delay=10):
         self.repo_id = repo_id
-        self.policy_type = policy_type
-        self.output_directory = Path(f"outputs/train/{policy_type}/{repo_id}")
+        self.output_directory = Path(f"outputs/train/{repo_id}")
         
         # Handle device properly
         if device is None:
@@ -61,22 +28,15 @@ class PolicyTrainer:
             self.device = device
             
         self.training_steps = n_steps
-        self.batch_size = batch_size
-        self.learning_rate = learning_rate
-        self.grad_clip_norm = grad_clip_norm
-        self.use_amp = use_amp
         self.log_freq = log_freq
         self.max_retries = max_retries
         self.retry_delay = retry_delay
-        
-        # Initialize placeholder variables
         self.dataset_metadata = None
         self.features = None
         self.output_features = None
         self.input_features = None
         self.config = None
         self.policy = None
-        self.grad_scaler = None
         
     def _with_retry(self, fn, operation_name):
         """Execute a function with retry logic for handling rate limits"""
@@ -134,7 +94,6 @@ class PolicyTrainer:
             return item
         
     def dataprep(self):
-        """Prepare the dataset for training"""
         # Make sure the output directory exists
         self.output_directory.mkdir(parents=True, exist_ok=True)
         
@@ -148,7 +107,7 @@ class PolicyTrainer:
         self.features = dataset_to_policy_features(self.dataset_metadata.features)
         self.output_features = {key: ft for key, ft in self.features.items() if ft.type is FeatureType.ACTION}
         
-        # Find all image features
+        # Find all image features and state features
         all_image_keys = [key for key in self.features if key.startswith("observation.images")]
         logger.info(f"All available image sources: {all_image_keys}")
         
@@ -171,8 +130,13 @@ class PolicyTrainer:
         logger.info(f"Input features for config: {list(self.input_features.keys())}")
         logger.info(f"Output features: {list(self.output_features.keys())}")
         
-        # Create the configuration based on policy type
-        self._create_policy_config()
+        # Create the configuration using our filtered inputs
+        self.config = DiffusionConfig(
+            input_features=self.input_features,
+            output_features=self.output_features,
+            # Ensure crop_shape is set appropriately
+            crop_shape=(84, 84)
+        )
         
         # Create delta timestamps for ALL features (including all image sources)
         self.delta_timestamps = {}
@@ -206,70 +170,23 @@ class PolicyTrainer:
             all_image_keys,
             target_size=(84, 84)
         )
-    
-    def _create_policy_config(self):
-        """Create policy configuration based on the selected policy type"""
-        if self.policy_type == "diffusion":
-            self.config = DiffusionConfig(
-                input_features=self.input_features,
-                output_features=self.output_features,
-                crop_shape=(84, 84)
-            )
-        # Add configurations for other policy types here
-        elif self.policy_type == "bc":
-            # Example for a Behavior Cloning policy configuration
-            # This would need to be implemented with your specific BC config
-            from lerobot.common.policies.bc.configuration_bc import BCConfig
-            self.config = BCConfig(
-                input_features=self.input_features,
-                output_features=self.output_features,
-                crop_shape=(84, 84)
-            )
-        else:
-            raise ValueError(f"Unsupported policy type: {self.policy_type}")
-    
-    def _create_policy(self):
-        """Create the policy model based on configuration"""
-        # Create policy based on the type
-        if self.policy_type == "diffusion":
-            self.policy = DiffusionPolicy(self.config, dataset_stats=self.dataset_metadata.stats)
-        # Add initializations for other policy types here
-        elif self.policy_type == "bc":
-            # Example for a Behavior Cloning policy
-            from lerobot.common.policies.bc.modeling_bc import BCPolicy
-            self.policy = BCPolicy(self.config, dataset_stats=self.dataset_metadata.stats)
-        else:
-            # Try to use the factory method from the reference code
-            try:
-                self.policy = make_policy(
-                    cfg=self.config,
-                    ds_meta=self.dataset_metadata,
-                )
-            except Exception as e:
-                logger.error(f"Failed to create policy using factory: {e}")
-                raise ValueError(f"Unsupported policy type: {self.policy_type}")
-                
-        self.policy.train()
-        self.policy.to(self.device)
         
     def train(self):
-        """Train the policy"""
         # Ensure data is prepared
         if self.dataset_metadata is None:
             self.dataprep()
         
         # Create and configure the policy
-        self._create_policy()
-        
-        # Initialize grad scaler for mixed precision training
-        self.grad_scaler = GradScaler(device_type=self.device.type, enabled=self.use_amp)
+        self.policy = DiffusionPolicy(self.config, dataset_stats=self.dataset_metadata.stats)
+        self.policy.train()
+        self.policy.to(self.device)
         
         # Create optimizer and dataloader
-        optimizer = torch.optim.Adam(self.policy.parameters(), lr=self.learning_rate)
+        optimizer = torch.optim.Adam(self.policy.parameters(), lr=1e-4)
         dataloader = torch.utils.data.DataLoader(
             self.dataset,
             num_workers=1,
-            batch_size=self.batch_size,
+            batch_size=64,
             shuffle=True,
             pin_memory=self.device.type != "cpu",
             drop_last=True,
@@ -297,30 +214,13 @@ class PolicyTrainer:
                     batch = {k: (v.to(self.device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
                     
                     try:
-                        # Forward pass with mixed precision if enabled
-                        with torch.autocast(device_type=self.device.type) if self.use_amp else nullcontext():
-                            loss, output_dict = self.policy.forward(batch)
-                        
-                        # Backward pass with gradient scaling
-                        self.grad_scaler.scale(loss).backward()
-                        
-                        # Unscale for gradient clipping
-                        self.grad_scaler.unscale_(optimizer)
-                        
-                        # Clip gradients
-                        grad_norm = torch.nn.utils.clip_grad_norm_(
-                            self.policy.parameters(),
-                            self.grad_clip_norm,
-                            error_if_nonfinite=False
-                        )
-                        
-                        # Step optimizer with scaling
-                        self.grad_scaler.step(optimizer)
-                        self.grad_scaler.update()
+                        loss, _ = self.policy.forward(batch)
+                        loss.backward()
+                        optimizer.step()
                         optimizer.zero_grad()
                         
                         if step % self.log_freq == 0:
-                            logger.info(f"step: {step} loss: {loss.item():.3f} grad_norm: {grad_norm.item():.3f}")
+                            logger.info(f"step: {step} loss: {loss.item():.3f}")
                         
                         step += 1
                         if step >= self.training_steps:
@@ -361,54 +261,17 @@ class PolicyTrainer:
             raise
 
 
+# Example usage:
 def main():
-    """Parse command line arguments and run the trainer"""
-    parser = argparse.ArgumentParser(description="Train a robotic policy")
-    parser.add_argument("--repo_id", type=str, required=True, help="Repository ID for the dataset")
-    parser.add_argument("--policy_type", type=str, default="diffusion", 
-                        choices=["diffusion", "bc"], 
-                        help="Type of policy to train")
-    parser.add_argument("--device", type=str, default=None, 
-                        help="Training device (default: use CUDA if available)")
-    parser.add_argument("--n_steps", type=int, default=5000, 
-                        help="Number of training steps")
-    parser.add_argument("--batch_size", type=int, default=64, 
-                        help="Batch size for training")
-    parser.add_argument("--learning_rate", type=float, default=1e-4, 
-                        help="Learning rate for optimizer")
-    parser.add_argument("--grad_clip_norm", type=float, default=1.0, 
-                        help="Gradient clipping norm")
-    parser.add_argument("--use_amp", action="store_true", 
-                        help="Use automatic mixed precision training")
-    parser.add_argument("--log_freq", type=int, default=10, 
-                        help="How often to log training progress")
-    parser.add_argument("--max_retries", type=int, default=10, 
-                        help="Maximum number of retries for API rate limits")
-    parser.add_argument("--retry_delay", type=int, default=30, 
-                        help="Delay between retries in seconds")
+    repo_id = "abhisb/so100_51_ep"  # Changed to match the error message
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    args = parser.parse_args()
-    
-    # Set device from args or use CUDA if available
-    device = None
-    if args.device:
-        device = torch.device(args.device)
-    else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # Initialize trainer with parsed arguments
-    trainer = PolicyTrainer(
-        repo_id=args.repo_id,
-        policy_type=args.policy_type,
-        device=device,
-        n_steps=args.n_steps,
-        batch_size=args.batch_size,
-        learning_rate=args.learning_rate,
-        grad_clip_norm=args.grad_clip_norm,
-        use_amp=args.use_amp,
-        log_freq=args.log_freq,
-        max_retries=args.max_retries,
-        retry_delay=args.retry_delay
+    # Initialize with more retries and longer delay between retries
+    trainer = TrainPolicy(
+        repo_id, 
+        device, 
+        max_retries=10, 
+        retry_delay=30
     )
     trainer.run()
 
