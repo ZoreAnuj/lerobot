@@ -23,7 +23,7 @@ from pathlib import Path
 from pprint import pformat
 from types import SimpleNamespace
 from typing import Any
-
+import math
 import datasets
 import jsonlines
 import numpy as np
@@ -465,6 +465,18 @@ def get_episode_data_index(
         "to": torch.LongTensor(cumulative_lengths),
     }
 
+def generate_timestamp_suggestions(dt, window=1.0):
+    """
+    Generate suggested delta timestamps that are integer multiples of dt
+    within a given window (in seconds). Returns two lists:
+      - past_suggestions: negative offsets (for past frames)
+      - future_suggestions: positive offsets (for future frames)
+    """
+    # Number of steps in the given window. We use floor to ensure an integer number of steps.
+    num_steps = math.floor(window / dt)
+    past_suggestions = [round(-i * dt, 4) for i in range(num_steps, 0, -1)]
+    future_suggestions = [round(i * dt, 4) for i in range(1, num_steps + 1)]
+    return past_suggestions, future_suggestions
 
 def check_timestamps_sync(
     timestamps: np.ndarray,
