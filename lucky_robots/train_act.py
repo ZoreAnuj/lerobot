@@ -25,7 +25,7 @@ class TrainACTPolicy():
                  save_freq=500, batch_size=32, max_retries=5, retry_delay=10,
                  add_version_tag=False, hf_token=None):
         self.repo_id = repo_id
-        self.output_directory = Path(f"outputs/train/{repo_id}")
+        self.output_directory = Path(f"outputs/train/act/{repo_id}")
         self.add_version_tag = add_version_tag
         self.hf_token = hf_token
         
@@ -545,7 +545,7 @@ class TrainACTPolicy():
 # Example usage:
 def main():
     # Replace with your actual dataset repo id
-    repo_id = "therarelab/so100_pick_place_2"  
+    repo_id = "abhisb/so100_51_ep"  
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # Set to your Hugging Face token if you want to auto-tag the dataset
