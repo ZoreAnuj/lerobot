@@ -422,6 +422,11 @@ def train(cfg: TrainPipelineConfig):
 
     if cfg.wandb.enable and cfg.wandb.project and is_main_process():
         wandb_logger = WandBLogger(cfg)
+    elif cfg.mlflow.enable and is_main_process():
+        # MLflowLogger implements the same interface as WandBLogger (log_dict/log_policy/log_video).
+        from lerobot.common.mlflow_utils import MLflowLogger
+
+        wandb_logger = MLflowLogger(cfg)
     else:
         wandb_logger = None
         if is_main_process():

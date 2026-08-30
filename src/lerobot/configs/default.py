@@ -101,6 +101,18 @@ class WandBConfig:
 
 
 @dataclass
+class MLflowConfig:
+    enable: bool = False
+    # Set to true to disable saving checkpoint artifacts despite training.save_checkpoint=True
+    disable_artifact: bool = False
+    experiment: str = "lerobot"
+    # MLflow tracking URI (e.g. "http://localhost:5000"). Defaults to a local file store under
+    # {output_dir}/mlflow, which can be browsed later with `mlflow ui --backend-store-uri <path>`.
+    tracking_uri: str | None = None
+    run_id: str | None = None
+
+
+@dataclass
 class EvalConfig:
     n_episodes: int = 50
     # `batch_size` specifies the number of environments to use in a gym.vector.VectorEnv.
