@@ -1,0 +1,782 @@
+#!/usr/bin/env python
+
+# Copyright 2025 QUT Centre for Robotics and The HuggingFace Inc. team.
+# All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""IMLE Policy as per "IMLE Policy: Fast and Sample Efficient Visuomotor Policy Learning via Implicit
+Maximum Likelihood Estimation" (paper: https://huggingface.co/papers/2502.12371,
+code: https://github.com/krishanrana/imle_policy).
+
+The policy is a one-step conditional generator: it maps a trajectory-shaped Gaussian latent and the
+observation conditioning to a full action chunk in a single forward pass (no iterative denoising). It is
+trained with the Rejection-Sampling IMLE objective: for every conditioning input, several candidate chunks
+are generated, candidates within `rs_epsilon` of the ground truth are rejected, and the nearest surviving
+candidate is pulled towards the ground truth.
+"""
+
+from collections import deque
+from collections.abc import Callable
+
+import einops
+import numpy as np
+import torch
+import torch.nn.functional as F  # noqa: N812
+import torchvision
+from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
+
+from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
+
+from ..pretrained import PreTrainedPolicy
+from ..utils import (
+    get_device_from_parameters,
+    get_dtype_from_parameters,
+    get_output_shape,
+    populate_queues,
+)
+from .configuration_imle import IMLEConfig
+
+
+class IMLEPolicy(PreTrainedPolicy):
+    """
+    IMLE Policy as per "IMLE Policy: Fast and Sample Efficient Visuomotor Policy Learning via Implicit
+    Maximum Likelihood Estimation" (paper: https://huggingface.co/papers/2502.12371,
+    code: https://github.com/krishanrana/imle_policy).
+    """
+
+    config_class = IMLEConfig
+    name = "imle"
+
+    def __init__(
+        self,
+        config: IMLEConfig,
+        **kwargs,
+    ):
+        """
+        Args:
+            config: Policy configuration class instance or None, in which case the default instantiation of
+                the configuration class is used.
+        """
+        super().__init__(config)
+        config.validate_features()
+        self.config = config
+
+        # queues are populated during rollout of the policy, they contain the n latest observations and actions
+        self._queues = None
+
+        self.imle = IMLEModel(config)
+
+        self.reset()
+
+    def get_optim_params(self) -> dict:
+        return self.imle.parameters()
+
+    def reset(self):
+        """Clear observation and action queues, and the trajectory-consistency state. Should be called on
+        `env.reset()`."""
+        self._queues = {
+            OBS_STATE: deque(maxlen=self.config.n_obs_steps),
+            ACTION: deque(maxlen=self.config.n_action_steps),
+        }
+        if self.config.image_features:
+            self._queues[OBS_IMAGES] = deque(maxlen=self.config.n_obs_steps)
+        if self.config.env_state_feature:
+            self._queues[OBS_ENV_STATE] = deque(maxlen=self.config.n_obs_steps)
+        self.imle.reset_consistency_state()
+
+    @torch.no_grad()
+    def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
+        """Predict a chunk of actions given environment observations.
+
+        Supports two modes:
+        - Online (queues populated via select_action): stacks observations from internal queues.
+        - Offline (empty queues, e.g. dataloader batch): uses the batch directly.
+        """
+        queues_populated = any(len(q) > 0 for q in self._queues.values())
+        if queues_populated:
+            batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
+        else:
+            batch = dict(batch)
+            if self.config.image_features:
+                for key in self.config.image_features:
+                    if batch[key].ndim == 4:
+                        batch[key] = batch[key].unsqueeze(1)
+                batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
+        actions = self.imle.generate_actions(batch, noise=noise)
+        return actions
+
+    @torch.no_grad()
+    def select_action(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
+        """Select a single action given environment observations.
+
+        This method handles caching a history of observations and an action trajectory generated by the
+        underlying one-step generator. Here's how it works:
+          - `n_obs_steps` steps worth of observations are cached (for the first steps, the observation is
+            copied `n_obs_steps` times to fill the cache).
+          - The generator produces `horizon` steps worth of actions in a single forward pass.
+          - `n_action_steps` worth of actions are actually kept for execution, starting from the current step.
+        Schematically this looks like:
+            ----------------------------------------------------------------------------------------------
+            (legend: o = n_obs_steps, h = horizon, a = n_action_steps)
+            |timestep            | n-o+1 | n-o+2 | ..... | n     | ..... | n+a-1 | n+a   | ..... | n-o+h |
+            |observation is used | YES   | YES   | YES   | YES   | NO    | NO    | NO    | NO    | NO    |
+            |action is generated | YES   | YES   | YES   | YES   | YES   | YES   | YES   | YES   | YES   |
+            |action is used      | NO    | NO    | NO    | YES   | YES   | YES   | NO    | NO    | NO    |
+            ----------------------------------------------------------------------------------------------
+        Note that this means we require: `n_action_steps <= horizon - n_obs_steps + 1`.
+        """
+        # NOTE: for offline evaluation, we have action in the batch, so we need to pop it out
+        if ACTION in batch:
+            batch.pop(ACTION)
+
+        if self.config.image_features:
+            batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
+            batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
+        # NOTE: It's important that this happens after stacking the images into a single key.
+        self._queues = populate_queues(self._queues, batch)
+
+        if len(self._queues[ACTION]) == 0:
+            actions = self.predict_action_chunk(batch, noise=noise)
+            self._queues[ACTION].extend(actions.transpose(0, 1))
+
+        action = self._queues[ACTION].popleft()
+        return action
+
+    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
+        """Run the batch through the model and compute the loss for training or validation."""
+        if self.config.image_features:
+            batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
+            for key in self.config.image_features:
+                if self.config.n_obs_steps == 1 and batch[key].ndim == 4:
+                    batch[key] = batch[key].unsqueeze(1)
+            batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
+        loss, loss_dict = self.imle.compute_loss(batch)
+        return loss, loss_dict
+
+
+def _rs_imle_loss(target: Tensor, samples: Tensor, epsilon: float) -> tuple[Tensor, dict]:
+    """Rejection-Sampling IMLE loss.
+
+    For each conditioning input, candidates within `epsilon` (L2 over the flattened chunk, in normalized
+    action space) of the ground truth are rejected, and the loss is the distance from the ground truth to the
+    nearest surviving candidate. Conditioning inputs whose candidates were all rejected do not contribute.
+
+    Args:
+        target: (B, horizon, action_dim) ground-truth action chunks.
+        samples: (B, n_samples, horizon, action_dim) generated candidate chunks.
+    Returns:
+        A scalar loss (zero, but still attached to the graph, if every candidate was rejected) and a dict of
+        detached metrics.
+    """
+    batch_size, n_samples = samples.shape[:2]
+    distances = torch.cdist(
+        target.reshape(batch_size, 1, -1), samples.reshape(batch_size, n_samples, -1)
+    ).squeeze(1)  # (B, n_samples)
+
+    rejected = distances <= epsilon
+    min_distances, _ = distances.masked_fill(rejected, torch.inf).min(dim=1)
+    valid = torch.isfinite(min_distances)
+
+    # When all candidates are rejected, contribute a graph-attached zero so the training step stays a
+    # no-op without needing special-casing in the trainer.
+    loss = min_distances[valid].mean() if valid.any() else samples.sum() * 0.0
+
+    loss_dict = {
+        "distance_mean": distances.mean().item(),
+        "distance_min": distances.min().item(),
+        "distance_max": distances.max().item(),
+        "rejection_rate": rejected.float().mean().item(),
+        "all_rejected_rate": (~valid).float().mean().item(),
+    }
+    return loss, loss_dict
+
+
+class IMLEModel(nn.Module):
+    def __init__(self, config: IMLEConfig):
+        super().__init__()
+        self.config = config
+
+        # Build observation encoders (depending on which observations are provided).
+        global_cond_dim = self.config.robot_state_feature.shape[0]
+        if self.config.image_features:
+            num_images = len(self.config.image_features)
+            if self.config.use_separate_rgb_encoder_per_camera:
+                encoders = [IMLERgbEncoder(config) for _ in range(num_images)]
+                self.rgb_encoder = nn.ModuleList(encoders)
+                global_cond_dim += encoders[0].feature_dim * num_images
+            else:
+                self.rgb_encoder = IMLERgbEncoder(config)
+                global_cond_dim += self.rgb_encoder.feature_dim * num_images
+        if self.config.env_state_feature:
+            global_cond_dim += self.config.env_state_feature.shape[0]
+
+        self.unet = IMLEConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
+
+        if config.compile_model:
+            self.unet = torch.compile(self.unet, mode=config.compile_mode)
+
+        self.reset_consistency_state()
+
+    def reset_consistency_state(self):
+        """Clear the previous-chunk anchor used by inference-time trajectory consistency."""
+        # Plain attributes (not buffers) so they are not persisted in checkpoints.
+        self._prev_chunk: Tensor | None = None
+        self._n_replans = 0
+
+    # ========= inference  ============
+    def _sample_chunks(self, global_cond: Tensor, noise: Tensor | None = None) -> Tensor:
+        """One-step generation of an action chunk per conditioning input.
+
+        Args:
+            global_cond: (B, global_cond_dim)
+            noise: optional (B, horizon, action_dim) latents; sampled if not provided.
+        Returns:
+            (B, horizon, action_dim)
+        """
+        device = get_device_from_parameters(self)
+        dtype = get_dtype_from_parameters(self)
+
+        if noise is None:
+            noise = torch.randn(
+                size=(global_cond.shape[0], self.config.horizon, self.config.action_feature.shape[0]),
+                dtype=dtype,
+                device=device,
+            )
+
+        return self.unet(noise, global_cond=global_cond)
+
+    def _select_consistent_chunks(self, global_cond: Tensor) -> Tensor:
+        """Sample `n_consistency_candidates` chunks per conditioning input and pick, for each batch element,
+        the candidate whose start is closest to the tail of the previously executed chunk."""
+        batch_size = global_cond.shape[0]
+        n_candidates = self.config.n_consistency_candidates
+        # The previous chunk's tail (the part not yet executed) overlaps in time with the start of the new
+        # chunk, so those segments are compared.
+        overlap = self.config.horizon - self.config.n_action_steps
+
+        repeated_cond = global_cond.repeat_interleave(n_candidates, dim=0)
+        candidates = self._sample_chunks(repeated_cond)
+        candidates = candidates.reshape(batch_size, n_candidates, *candidates.shape[1:])
+
+        if self._prev_chunk is None or self._prev_chunk.shape[0] != batch_size:
+            self._prev_chunk = torch.randn(
+                (batch_size, self.config.horizon, self.config.action_feature.shape[0]),
+                dtype=candidates.dtype,
+                device=candidates.device,
+            )
+
+        prev_tail = self._prev_chunk[:, self.config.n_action_steps :].reshape(batch_size, 1, -1)
+        candidate_starts = candidates[:, :, :overlap].reshape(batch_size, n_candidates, -1)
+        distances = torch.cdist(prev_tail, candidate_starts).squeeze(1)  # (B, n_candidates)
+        best = distances.argmin(dim=1)
+        chunks = candidates[torch.arange(batch_size, device=candidates.device), best]
+
+        self._n_replans += 1
+        reset_every = self.config.consistency_reset_every
+        if reset_every > 0 and self._n_replans % reset_every == 0:
+            # Periodically drop the anchor so the policy doesn't lock into a single mode.
+            self._prev_chunk = None
+        else:
+            self._prev_chunk = chunks
+
+        return chunks
+
+    def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
+        """Encode image features and concatenate them all together along with the state vector."""
+        batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
+        global_cond_feats = [batch[OBS_STATE]]
+        # Extract image features.
+        if self.config.image_features:
+            if self.config.use_separate_rgb_encoder_per_camera:
+                # Combine batch and sequence dims while rearranging to make the camera index dimension first.
+                images_per_camera = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> n (b s) ...")
+                img_features_list = torch.cat(
+                    [
+                        encoder(images)
+                        for encoder, images in zip(self.rgb_encoder, images_per_camera, strict=True)
+                    ]
+                )
+                # Separate batch and sequence dims back out. The camera index dim gets absorbed into the
+                # feature dim (effectively concatenating the camera features).
+                img_features = einops.rearrange(
+                    img_features_list, "(n b s) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
+                )
+            else:
+                # Combine batch, sequence, and "which camera" dims before passing to shared encoder.
+                img_features = self.rgb_encoder(
+                    einops.rearrange(batch[OBS_IMAGES], "b s n ... -> (b s n) ...")
+                )
+                # Separate batch dim and sequence dim back out. The camera index dim gets absorbed into the
+                # feature dim (effectively concatenating the camera features).
+                img_features = einops.rearrange(
+                    img_features, "(b s n) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
+                )
+            global_cond_feats.append(img_features)
+
+        if self.config.env_state_feature:
+            global_cond_feats.append(batch[OBS_ENV_STATE])
+
+        # Concatenate features then flatten to (B, global_cond_dim).
+        return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
+
+    def generate_actions(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
+        """
+        This function expects `batch` to have:
+        {
+            "observation.state": (B, n_obs_steps, state_dim)
+
+            "observation.images": (B, n_obs_steps, num_cameras, C, H, W)
+                AND/OR
+            "observation.environment_state": (B, n_obs_steps, environment_dim)
+        }
+        """
+        batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
+        assert n_obs_steps == self.config.n_obs_steps
+
+        # Encode image features and concatenate them all together along with the state vector.
+        global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
+
+        if self.config.use_traj_consistency and noise is None:
+            actions = self._select_consistent_chunks(global_cond)
+        else:
+            actions = self._sample_chunks(global_cond, noise=noise)
+
+        # Extract `n_action_steps` steps worth of actions (from the current observation).
+        start = n_obs_steps - 1
+        end = start + self.config.n_action_steps
+        actions = actions[:, start:end]
+
+        return actions
+
+    def compute_loss(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
+        """
+        This function expects `batch` to have (at least):
+        {
+            "observation.state": (B, n_obs_steps, state_dim)
+
+            "observation.images": (B, n_obs_steps, num_cameras, C, H, W)
+                AND/OR
+            "observation.environment_state": (B, n_obs_steps, environment_dim)
+
+            "action": (B, horizon, action_dim)
+        }
+        """
+        # Input validation.
+        assert set(batch).issuperset({OBS_STATE, ACTION})
+        assert OBS_IMAGES in batch or OBS_ENV_STATE in batch
+        n_obs_steps = batch[OBS_STATE].shape[1]
+        horizon = batch[ACTION].shape[1]
+        assert horizon == self.config.horizon
+        assert n_obs_steps == self.config.n_obs_steps
+
+        batch_size = batch[ACTION].shape[0]
+        n_samples = self.config.n_samples_per_condition
+
+        # Encode the observations once per conditioning input, then fan out to n_samples latents each.
+        global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
+        repeated_cond = global_cond.repeat_interleave(n_samples, dim=0)
+
+        samples = self._sample_chunks(repeated_cond)
+        samples = samples.reshape(batch_size, n_samples, *samples.shape[1:])
+
+        return _rs_imle_loss(batch[ACTION], samples, self.config.rs_epsilon)
+
+
+class SpatialSoftmax(nn.Module):
+    """
+    Spatial Soft Argmax operation described in "Deep Spatial Autoencoders for Visuomotor Learning" by Finn et al.
+    (https://huggingface.co/papers/1509.06113). A minimal port of the robomimic implementation.
+
+    At a high level, this takes 2D feature maps (from a convnet/ViT) and returns the "center of mass"
+    of activations of each channel, i.e., keypoints in the image space for the policy to focus on.
+
+    Example: take feature maps of size (512x10x12). We generate a grid of normalized coordinates (10x12x2):
+    -----------------------------------------------------
+    | (-1., -1.)   | (-0.82, -1.)   | ... | (1., -1.)   |
+    | (-1., -0.78) | (-0.82, -0.78) | ... | (1., -0.78) |
+    | ...          | ...            | ... | ...         |
+    | (-1., 1.)    | (-0.82, 1.)    | ... | (1., 1.)    |
+    -----------------------------------------------------
+    This is achieved by applying channel-wise softmax over the activations (512x120) and computing the dot
+    product with the coordinates (120x2) to get expected points of maximal activation (512x2).
+
+    The example above results in 512 keypoints (corresponding to the 512 input channels). We can optionally
+    provide num_kp != None to control the number of keypoints. This is achieved by a first applying a learnable
+    linear mapping (in_channels, H, W) -> (num_kp, H, W).
+    """
+
+    def __init__(self, input_shape, num_kp=None):
+        """
+        Args:
+            input_shape (list): (C, H, W) input feature map shape.
+            num_kp (int): number of keypoints in output. If None, output will have the same number of channels as input.
+        """
+        super().__init__()
+
+        assert len(input_shape) == 3
+        self._in_c, self._in_h, self._in_w = input_shape
+
+        if num_kp is not None:
+            self.nets = torch.nn.Conv2d(self._in_c, num_kp, kernel_size=1)
+            self._out_c = num_kp
+        else:
+            self.nets = None
+            self._out_c = self._in_c
+
+        # we could use torch.linspace directly but that seems to behave slightly differently than numpy
+        # and causes a small degradation in pc_success of pre-trained models.
+        pos_x, pos_y = np.meshgrid(np.linspace(-1.0, 1.0, self._in_w), np.linspace(-1.0, 1.0, self._in_h))
+        pos_x = torch.from_numpy(pos_x.reshape(self._in_h * self._in_w, 1)).float()
+        pos_y = torch.from_numpy(pos_y.reshape(self._in_h * self._in_w, 1)).float()
+        # register as buffer so it's moved to the correct device.
+        self.register_buffer("pos_grid", torch.cat([pos_x, pos_y], dim=1))
+
+    def forward(self, features: Tensor) -> Tensor:
+        """
+        Args:
+            features: (B, C, H, W) input feature maps.
+        Returns:
+            (B, K, 2) image-space coordinates of keypoints.
+        """
+        if self.nets is not None:
+            features = self.nets(features)
+
+        # [B, K, H, W] -> [B * K, H * W] where K is number of keypoints
+        features = features.reshape(-1, self._in_h * self._in_w)
+        # 2d softmax normalization
+        attention = F.softmax(features, dim=-1)
+        # [B * K, H * W] x [H * W, 2] -> [B * K, 2] for spatial coordinate mean in x and y dimensions
+        expected_xy = attention @ self.pos_grid
+        # reshape to [B, K, 2]
+        feature_keypoints = expected_xy.view(-1, self._out_c, 2)
+
+        return feature_keypoints
+
+
+class IMLERgbEncoder(nn.Module):
+    """Encodes an RGB image into a 1D feature vector.
+
+    Includes the ability to normalize and crop the image first.
+    """
+
+    def __init__(self, config: IMLEConfig):
+        super().__init__()
+        # Set up optional preprocessing.
+        if config.resize_shape is not None:
+            self.resize = torchvision.transforms.Resize(config.resize_shape)
+        else:
+            self.resize = None
+
+        crop_shape = config.crop_shape
+        if crop_shape is not None:
+            self.do_crop = True
+            # Always use center crop for eval
+            self.center_crop = torchvision.transforms.CenterCrop(crop_shape)
+            if config.crop_is_random:
+                self.maybe_random_crop = torchvision.transforms.RandomCrop(crop_shape)
+            else:
+                self.maybe_random_crop = self.center_crop
+        else:
+            self.do_crop = False
+
+        # Set up backbone.
+        backbone_model = getattr(torchvision.models, config.vision_backbone)(
+            weights=config.pretrained_backbone_weights
+        )
+        # Note: This assumes that the layer4 feature map is children()[-3]
+        self.backbone = nn.Sequential(*(list(backbone_model.children())[:-2]))
+        if config.use_group_norm:
+            if config.pretrained_backbone_weights:
+                raise ValueError(
+                    "You can't replace BatchNorm in a pretrained model without ruining the weights!"
+                )
+            self.backbone = _replace_submodules(
+                root_module=self.backbone,
+                predicate=lambda x: isinstance(x, nn.BatchNorm2d),
+                func=lambda x: nn.GroupNorm(num_groups=x.num_features // 16, num_channels=x.num_features),
+            )
+
+        # Set up pooling and final layers.
+        # Use a dry run to get the feature map shape.
+        # The dummy shape mirrors the runtime preprocessing order: resize -> crop.
+
+        # Note: we have a check in the config class to make sure all images have the same shape.
+        images_shape = next(iter(config.image_features.values())).shape
+        if config.crop_shape is not None:
+            dummy_shape_h_w = config.crop_shape
+        elif config.resize_shape is not None:
+            dummy_shape_h_w = config.resize_shape
+        else:
+            dummy_shape_h_w = images_shape[1:]
+        dummy_shape = (1, images_shape[0], *dummy_shape_h_w)
+        feature_map_shape = get_output_shape(self.backbone, dummy_shape)[1:]
+
+        self.pool = SpatialSoftmax(feature_map_shape, num_kp=config.spatial_softmax_num_keypoints)
+        self.feature_dim = config.spatial_softmax_num_keypoints * 2
+        self.out = nn.Linear(config.spatial_softmax_num_keypoints * 2, self.feature_dim)
+        self.relu = nn.ReLU()
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Args:
+            x: (B, C, H, W) image tensor with pixel values in [0, 1].
+        Returns:
+            (B, D) image feature.
+        """
+        # Preprocess: resize if configured, then crop if configured.
+
+        if self.resize is not None:
+            x = self.resize(x)
+        if self.do_crop:
+            if self.training:  # noqa: SIM108
+                x = self.maybe_random_crop(x)
+            else:
+                # Always use center crop for eval.
+                x = self.center_crop(x)
+        # Extract backbone feature.
+        x = torch.flatten(self.pool(self.backbone(x)), start_dim=1)
+        # Final linear layer with non-linearity.
+        x = self.relu(self.out(x))
+        return x
+
+
+def _replace_submodules(
+    root_module: nn.Module, predicate: Callable[[nn.Module], bool], func: Callable[[nn.Module], nn.Module]
+) -> nn.Module:
+    """
+    Args:
+        root_module: The module for which the submodules need to be replaced
+        predicate: Takes a module as an argument and must return True if the that module is to be replaced.
+        func: Takes a module as an argument and returns a new module to replace it with.
+    Returns:
+        The root module with its submodules replaced.
+    """
+    if predicate(root_module):
+        return func(root_module)
+
+    replace_list = [k.split(".") for k, m in root_module.named_modules(remove_duplicate=True) if predicate(m)]
+    for *parents, k in replace_list:
+        parent_module = root_module
+        if len(parents) > 0:
+            parent_module = root_module.get_submodule(".".join(parents))
+        if isinstance(parent_module, nn.Sequential):
+            src_module = parent_module[int(k)]
+        else:
+            src_module = getattr(parent_module, k)
+        tgt_module = func(src_module)
+        if isinstance(parent_module, nn.Sequential):
+            parent_module[int(k)] = tgt_module
+        else:
+            setattr(parent_module, k, tgt_module)
+    # verify that all BN are replaced
+    assert not any(predicate(m) for _, m in root_module.named_modules(remove_duplicate=True))
+    return root_module
+
+
+class IMLEConv1dBlock(nn.Module):
+    """Conv1d --> GroupNorm --> Mish"""
+
+    def __init__(self, inp_channels, out_channels, kernel_size, n_groups=8):
+        super().__init__()
+
+        self.block = nn.Sequential(
+            nn.Conv1d(inp_channels, out_channels, kernel_size, padding=kernel_size // 2),
+            nn.GroupNorm(n_groups, out_channels),
+            nn.Mish(),
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class IMLEConditionalUnet1d(nn.Module):
+    """A 1D convolutional UNet with FiLM modulation for conditioning.
+
+    This is the Diffusion Policy UNet with the diffusion-timestep pathway removed: the latent noise plays the
+    role of the input sample and the observation features are the only FiLM conditioning, so one forward pass
+    produces a full action chunk.
+    """
+
+    def __init__(self, config: IMLEConfig, global_cond_dim: int):
+        super().__init__()
+
+        self.config = config
+
+        # The FiLM conditioning dimension (observation features only, no timestep embedding).
+        cond_dim = global_cond_dim
+
+        # In channels / out channels for each downsampling block in the Unet's encoder. For the decoder, we
+        # just reverse these.
+        in_out = [(config.action_feature.shape[0], config.down_dims[0])] + list(
+            zip(config.down_dims[:-1], config.down_dims[1:], strict=True)
+        )
+
+        # Unet encoder.
+        common_res_block_kwargs = {
+            "cond_dim": cond_dim,
+            "kernel_size": config.kernel_size,
+            "n_groups": config.n_groups,
+            "use_film_scale_modulation": config.use_film_scale_modulation,
+        }
+        self.down_modules = nn.ModuleList([])
+        for ind, (dim_in, dim_out) in enumerate(in_out):
+            is_last = ind >= (len(in_out) - 1)
+            self.down_modules.append(
+                nn.ModuleList(
+                    [
+                        IMLEConditionalResidualBlock1d(dim_in, dim_out, **common_res_block_kwargs),
+                        IMLEConditionalResidualBlock1d(dim_out, dim_out, **common_res_block_kwargs),
+                        # Downsample as long as it is not the last block.
+                        nn.Conv1d(dim_out, dim_out, 3, 2, 1) if not is_last else nn.Identity(),
+                    ]
+                )
+            )
+
+        # Processing in the middle of the auto-encoder.
+        self.mid_modules = nn.ModuleList(
+            [
+                IMLEConditionalResidualBlock1d(
+                    config.down_dims[-1], config.down_dims[-1], **common_res_block_kwargs
+                ),
+                IMLEConditionalResidualBlock1d(
+                    config.down_dims[-1], config.down_dims[-1], **common_res_block_kwargs
+                ),
+            ]
+        )
+
+        # Unet decoder.
+        self.up_modules = nn.ModuleList([])
+        for ind, (dim_out, dim_in) in enumerate(reversed(in_out[1:])):
+            is_last = ind >= (len(in_out) - 1)
+            self.up_modules.append(
+                nn.ModuleList(
+                    [
+                        # dim_in * 2, because it takes the encoder's skip connection as well
+                        IMLEConditionalResidualBlock1d(dim_in * 2, dim_out, **common_res_block_kwargs),
+                        IMLEConditionalResidualBlock1d(dim_out, dim_out, **common_res_block_kwargs),
+                        # Upsample as long as it is not the last block.
+                        nn.ConvTranspose1d(dim_out, dim_out, 4, 2, 1) if not is_last else nn.Identity(),
+                    ]
+                )
+            )
+
+        self.final_conv = nn.Sequential(
+            IMLEConv1dBlock(config.down_dims[0], config.down_dims[0], kernel_size=config.kernel_size),
+            nn.Conv1d(config.down_dims[0], config.action_feature.shape[0], 1),
+        )
+
+    def forward(self, x: Tensor, global_cond: Tensor) -> Tensor:
+        """
+        Args:
+            x: (B, T, input_dim) latent noise sample for input to the Unet.
+            global_cond: (B, global_cond_dim)
+        Returns:
+            (B, T, input_dim) generated action chunk.
+        """
+        # For 1D convolutions we'll need feature dimension first.
+        x = einops.rearrange(x, "b t d -> b d t")
+
+        use_gc = self.config.gradient_checkpointing and self.training
+
+        # Run encoder, keeping track of skip features to pass to the decoder.
+        encoder_skip_features: list[Tensor] = []
+        for resnet, resnet2, downsample in self.down_modules:
+            if use_gc:
+                x = checkpoint(resnet, x, global_cond, use_reentrant=False)
+                x = checkpoint(resnet2, x, global_cond, use_reentrant=False)
+            else:
+                x = resnet(x, global_cond)
+                x = resnet2(x, global_cond)
+            encoder_skip_features.append(x)
+            x = downsample(x)
+
+        for mid_module in self.mid_modules:
+            if use_gc:
+                x = checkpoint(mid_module, x, global_cond, use_reentrant=False)
+            else:
+                x = mid_module(x, global_cond)
+
+        # Run decoder, using the skip features from the encoder.
+        for resnet, resnet2, upsample in self.up_modules:
+            x = torch.cat((x, encoder_skip_features.pop()), dim=1)
+            if use_gc:
+                x = checkpoint(resnet, x, global_cond, use_reentrant=False)
+                x = checkpoint(resnet2, x, global_cond, use_reentrant=False)
+            else:
+                x = resnet(x, global_cond)
+                x = resnet2(x, global_cond)
+            x = upsample(x)
+
+        x = self.final_conv(x)
+
+        x = einops.rearrange(x, "b d t -> b t d")
+        return x
+
+
+class IMLEConditionalResidualBlock1d(nn.Module):
+    """ResNet style 1D convolutional block with FiLM modulation for conditioning."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        cond_dim: int,
+        kernel_size: int = 3,
+        n_groups: int = 8,
+        # Set to True to do scale modulation with FiLM as well as bias modulation (defaults to False meaning
+        # FiLM just modulates bias).
+        use_film_scale_modulation: bool = False,
+    ):
+        super().__init__()
+
+        self.use_film_scale_modulation = use_film_scale_modulation
+        self.out_channels = out_channels
+
+        self.conv1 = IMLEConv1dBlock(in_channels, out_channels, kernel_size, n_groups=n_groups)
+
+        # FiLM modulation (https://huggingface.co/papers/1709.07871) outputs per-channel bias and (maybe) scale.
+        cond_channels = out_channels * 2 if use_film_scale_modulation else out_channels
+        self.cond_encoder = nn.Sequential(nn.Mish(), nn.Linear(cond_dim, cond_channels))
+
+        self.conv2 = IMLEConv1dBlock(out_channels, out_channels, kernel_size, n_groups=n_groups)
+
+        # A final convolution for dimension matching the residual (if needed).
+        self.residual_conv = (
+            nn.Conv1d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
+        )
+
+    def forward(self, x: Tensor, cond: Tensor) -> Tensor:
+        """
+        Args:
+            x: (B, in_channels, T)
+            cond: (B, cond_dim)
+        Returns:
+            (B, out_channels, T)
+        """
+        out = self.conv1(x)
+
+        # Get condition embedding. Unsqueeze for broadcasting to `out`, resulting in (B, out_channels, 1).
+        cond_embed = self.cond_encoder(cond).unsqueeze(-1)
+        if self.use_film_scale_modulation:
+            # Treat the embedding as a list of scales and biases.
+            scale = cond_embed[:, : self.out_channels]
+            bias = cond_embed[:, self.out_channels :]
+            out = scale * out + bias
+        else:
+            # Treat the embedding as biases.
+            out = out + cond_embed
+
+        out = self.conv2(out)
+        out = out + self.residual_conv(x)
+        return out

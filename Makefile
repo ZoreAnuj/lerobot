@@ -38,6 +38,8 @@ test-end-to-end:
 	${MAKE} DEVICE=$(DEVICE) test-act-ete-eval
 	${MAKE} DEVICE=$(DEVICE) test-diffusion-ete-train
 	${MAKE} DEVICE=$(DEVICE) test-diffusion-ete-eval
+	${MAKE} DEVICE=$(DEVICE) test-imle-ete-train
+	${MAKE} DEVICE=$(DEVICE) test-imle-ete-eval
 	${MAKE} DEVICE=$(DEVICE) test-tdmpc-ete-train
 	${MAKE} DEVICE=$(DEVICE) test-tdmpc-ete-eval
 	${MAKE} DEVICE=$(DEVICE) test-smolvla-ete-train
@@ -108,6 +110,38 @@ test-diffusion-ete-train:
 test-diffusion-ete-eval:
 	lerobot-eval \
 		--policy.path=tests/outputs/diffusion/checkpoints/000002/pretrained_model \
+		--policy.device=$(DEVICE) \
+		--env.type=pusht \
+		--env.episode_length=5 \
+		--eval.n_episodes=1 \
+		--eval.batch_size=1
+
+test-imle-ete-train:
+	lerobot-train \
+		--policy.type=imle \
+		--policy.down_dims='[64,128,256]' \
+		--policy.n_samples_per_condition=4 \
+		--policy.device=$(DEVICE) \
+		--policy.push_to_hub=false \
+		--env.type=pusht \
+		--env.episode_length=5 \
+		--dataset.repo_id=lerobot/pusht \
+		--dataset.image_transforms.enable=true \
+		--dataset.episodes="[0]" \
+		--batch_size=2 \
+		--steps=2 \
+		--env_eval_freq=2 \
+		--eval.n_episodes=1 \
+		--eval.batch_size=1 \
+		--save_checkpoint=true \
+		--save_freq=2 \
+		--log_freq=1 \
+		--wandb.enable=false \
+		--output_dir=tests/outputs/imle/
+
+test-imle-ete-eval:
+	lerobot-eval \
+		--policy.path=tests/outputs/imle/checkpoints/000002/pretrained_model \
 		--policy.device=$(DEVICE) \
 		--env.type=pusht \
 		--env.episode_length=5 \

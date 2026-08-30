@@ -58,7 +58,7 @@ _POLICY_REQUIRED_PACKAGES: dict[str, tuple[str, ...]] = {
     "diffusion": ("diffusers",),
 }
 
-_ALL_POLICIES = ["act", "diffusion", "tdmpc", "vqbet"]
+_ALL_POLICIES = ["act", "diffusion", "imle", "tdmpc", "vqbet"]
 AVAILABLE_POLICIES = [
     p for p in _ALL_POLICIES if all(is_package_available(pkg) for pkg in _POLICY_REQUIRED_PACKAGES.get(p, ()))
 ]
@@ -113,6 +113,7 @@ def test_get_policy_and_config_classes(policy_name: str):
     "ds_repo_id,env_name,env_kwargs,policy_name,policy_kwargs",
     [
         ("lerobot/pusht", "pusht", {}, "diffusion", {}),
+        ("lerobot/pusht", "pusht", {}, "imle", {}),
         ("lerobot/pusht", "pusht", {}, "vqbet", {}),
         ("lerobot/pusht", "pusht", {}, "act", {}),
         ("lerobot/aloha_sim_insertion_human", "aloha", {"task": "AlohaInsertion-v0"}, "act", {}),
