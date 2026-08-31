@@ -113,6 +113,22 @@ Similarly to the hardware, you can easily implement your own policy & leverage L
 
 For detailed policy setup guides, see the [Policy Documentation](https://huggingface.co/docs/lerobot/bring_your_own_policies). For GPU/RAM requirements and expected training time per policy, see the [Compute Hardware Guide](https://huggingface.co/docs/lerobot/hardware_guide).
 
+### Trained Checkpoints (dice pick-and-place, Fanuc CRX-5iA)
+
+Checkpoints for the IMLE and SmolVLA policies trained on [`azorematter/dice_white_pnp_100`](https://huggingface.co/datasets/azorematter/dice_white_pnp_100) (cameras `gripper` + `cam0`, 7-dim joint-space state/action):
+
+| Policy | Hub repo | Final checkpoint |
+| --- | --- | --- |
+| IMLE (`--policy.type=imle`) | [`azorematter/imle_dice_white_pnp`](https://huggingface.co/azorematter/imle_dice_white_pnp) | `checkpoints/100000/pretrained_model` (EMA variant in `pretrained_model_ema`) |
+| SmolVLA (finetuned from `lerobot/smolvla_base`) | [`azorematter/smolvla_dice_white_pnp`](https://huggingface.co/azorematter/smolvla_dice_white_pnp) | `checkpoints/030000/pretrained_model` |
+
+Intermediate checkpoints are stored every 5k steps under `checkpoints/<step>/`. To use one (repos are private — authenticate with `hf auth login` first):
+
+```bash
+hf download azorematter/imle_dice_white_pnp --include "checkpoints/100000/pretrained_model_ema/*" --local-dir ./imle_ckpt
+lerobot-eval --policy.path=./imle_ckpt/checkpoints/100000/pretrained_model_ema ...
+```
+
 ## Inference & Evaluation
 
 Evaluate your policies in simulation or on real hardware using the unified evaluation script. LeRobot supports standard benchmarks like **LIBERO**, **MetaWorld** and more to come.
