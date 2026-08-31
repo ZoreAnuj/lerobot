@@ -122,6 +122,15 @@ Checkpoints for the IMLE and SmolVLA policies trained on [`azorematter/dice_whit
 | IMLE (`--policy.type=imle`) | [`azorematter/imle_dice_white_pnp`](https://huggingface.co/azorematter/imle_dice_white_pnp) | `checkpoints/100000/pretrained_model` (EMA variant in `pretrained_model_ema`) |
 | SmolVLA (finetuned from `lerobot/smolvla_base`) | [`azorematter/smolvla_dice_white_pnp`](https://huggingface.co/azorematter/smolvla_dice_white_pnp) | `checkpoints/030000/pretrained_model` |
 
+**Top 3 checkpoints per policy**, ranked by open-loop joint MAE against the demonstrations
+(100 sampled frames, executed 8-step window, degrees; gripper = open/close accuracy):
+
+| Rank | IMLE checkpoint | MAE | Gripper | SmolVLA checkpoint | MAE | Gripper |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | `checkpoints/100000/pretrained_model_ema` | 0.051° | 99.1% | `checkpoints/030000/pretrained_model` | 0.153° | 99.3% |
+| 2 | `checkpoints/100000/pretrained_model` | 0.054° | 99.5% | `checkpoints/025000/pretrained_model` | 0.170° | 99.5% |
+| 3 | `checkpoints/080000/pretrained_model_ema` | 0.055° | 99.8% | `checkpoints/020000/pretrained_model` | 0.221° | 99.4% |
+
 Intermediate checkpoints are stored every 5k steps under `checkpoints/<step>/`. To use one (repos are private — authenticate with `hf auth login` first):
 
 ```bash
