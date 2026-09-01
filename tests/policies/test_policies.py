@@ -551,3 +551,51 @@ def test_vqbet_discretize_keeps_buffers_on_device():
         "vq_layer.freeze_codebook was moved off the model device after discretize(). "
         "Use .fill_(True) instead of = torch.tensor(True) to keep the buffer on device."
     )
+
+
+def test_act_separate_backbone_per_camera():
+    """Per-camera backbones: distinct parameters, param names keep the model.backbone prefix."""
+    from lerobot.configs.types import FeatureType, PolicyFeature
+    from lerobot.policies.act.configuration_act import ACTConfig
+    from lerobot.policies.act.modeling_act import ACTPolicy
+    from lerobot.utils.constants import ACTION, OBS_STATE
+
+    config = ACTConfig(
+        chunk_size=8,
+        n_action_steps=8,
+        dim_model=64,
+        n_heads=2,
+        dim_feedforward=128,
+        n_encoder_layers=2,
+        n_decoder_layers=1,
+        vision_backbone="resnet18",
+        pretrained_backbone_weights=None,
+        use_separate_backbone_per_camera=True,
+    )
+    config.input_features = {
+        OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(4,)),
+        "observation.images.a": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 64, 64)),
+        "observation.images.b": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 64, 64)),
+    }
+    config.output_features = {ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(3,))}
+    config.device = "cpu"
+    policy = ACTPolicy(config)
+
+    assert len(policy.model.backbone) == 2
+    p0 = dict(policy.model.backbone[0].named_parameters())
+    p1 = dict(policy.model.backbone[1].named_parameters())
+    assert p0.keys() == p1.keys()
+    assert all(a.data_ptr() != b.data_ptr() for a, b in zip(p0.values(), p1.values()))
+    # Optimizer's backbone LR group still matches by prefix.
+    assert any(n.startswith("model.backbone") for n, _ in policy.named_parameters())
+
+    batch = {
+        OBS_STATE: torch.randn(2, 4),
+        "observation.images.a": torch.rand(2, 3, 64, 64),
+        "observation.images.b": torch.rand(2, 3, 64, 64),
+        ACTION: torch.randn(2, 8, 3),
+        "action_is_pad": torch.zeros(2, 8, dtype=torch.bool),
+    }
+    loss, _ = policy.forward(batch)
+    assert loss.requires_grad
+    loss.backward()

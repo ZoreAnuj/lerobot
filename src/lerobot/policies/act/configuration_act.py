@@ -96,6 +96,9 @@ class ACTConfig(PreTrainedConfig):
     # Architecture.
     # Vision backbone.
     vision_backbone: str = "resnet18"
+    # When True, each camera view gets its own backbone (recommended by the ACT tuning guide for
+    # multi-camera setups); when False (default, original behavior) one backbone is shared.
+    use_separate_backbone_per_camera: bool = False
     pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
     replace_final_stride_with_dilation: int = False
     # Transformer layers.
