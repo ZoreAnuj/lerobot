@@ -162,6 +162,12 @@ class IMLEConfig(PreTrainedConfig):
     # Optimization.
     compile_model: bool = False
     compile_mode: str = "reduce-overhead"
+    # Run the generator (and therefore the RS-IMLE distances) in fp32 even under bf16/fp16 autocast.
+    # bf16 rounding of a candidate chunk is an L2 perturbation of ~0.017 in normalized action space —
+    # comparable to `rs_epsilon` (0.03) and larger than the smallest observed candidate distances, so it
+    # would blur the epsilon-rejection that keeps the generator from collapsing. The encoders stay in
+    # low precision, which is where the speedup is anyway (~69% of the model's compute).
+    fp32_generator: bool = True
 
     # Training presets
     optimizer_lr: float = 1e-4

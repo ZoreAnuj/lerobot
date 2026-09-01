@@ -314,6 +314,12 @@ class IMLEModel(nn.Module):
                 device=device,
             )
 
+        if self.config.fp32_generator and torch.is_autocast_enabled(device.type):
+            # Keep the generated chunks in fp32: their distances are compared against `rs_epsilon`,
+            # and bf16 rounding is the same order as epsilon itself (see `fp32_generator`).
+            with torch.autocast(device_type=device.type, enabled=False):
+                return self.unet(noise.float(), global_cond=global_cond.float())
+
         return self.unet(noise, global_cond=global_cond)
 
     def _select_consistent_chunks(self, global_cond: Tensor) -> Tensor:
@@ -454,6 +460,12 @@ class IMLEModel(nn.Module):
         if self.config.rs_gripper_weight != 1.0:
             channel_weights = torch.ones(self.config.action_feature.shape[0], device=samples.device)
             channel_weights[-1] = self.config.rs_gripper_weight
+
+        if self.config.fp32_generator and torch.is_autocast_enabled(samples.device.type):
+            with torch.autocast(device_type=samples.device.type, enabled=False):
+                return _rs_imle_loss(
+                    batch[ACTION].float(), samples.float(), self.config.rs_epsilon, channel_weights
+                )
 
         return _rs_imle_loss(batch[ACTION], samples, self.config.rs_epsilon, channel_weights)
 

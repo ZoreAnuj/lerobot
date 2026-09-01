@@ -15,12 +15,14 @@
 # limitations under the License.
 """Private reader component for LeRobotDataset. Handles random-access reading (HF dataset, delta indices, video decoding)."""
 
+import json
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import datasets
+import numpy as np
 import torch
 
 from lerobot.configs import (
@@ -156,6 +158,8 @@ class DatasetReader(BaseDatasetReader):
 
         self.hf_dataset: datasets.Dataset | None = None
         self._absolute_to_relative_idx: dict[int, int] | None = None
+        # Lazily-opened raw frame cache, used only by the "memmap" video backend (see _query_memmap).
+        self._frame_cache: dict[str, np.memmap] | None = None
 
         # Setup delta_indices (doesn't depend on hf_dataset)
         self.delta_indices = None
@@ -350,12 +354,46 @@ class DatasetReader(BaseDatasetReader):
                 result[key] = torch.stack(self.hf_dataset[relative_indices][key])
         return result
 
+    def _query_memmap(self, ep: dict, query_timestamps: dict[str, list[float]]) -> dict[str, torch.Tensor]:
+        """Serve frames from a pre-decoded uint8 cache instead of decoding video.
+
+        The cache is `frame_cache/<video_key>.uint8`, a (total_frames, H, W, 3) memmap indexed by the
+        dataset-global frame index, plus `frame_cache/index.json` describing it. Random access costs
+        ~0.1 ms/frame against ~4 ms for a seek-and-decode, which is what keeps the GPUs fed on a box
+        whose CPUs are shared with other jobs.
+        """
+        if self._frame_cache is None:
+            spec = json.loads((self.root / "frame_cache" / "index.json").read_text())
+            self._frame_cache = {
+                key: np.memmap(
+                    self.root / "frame_cache" / f"{key}.uint8",
+                    dtype=np.uint8,
+                    mode="r",
+                    shape=tuple(shape),
+                )
+                for key, shape in spec["keys"].items()
+            }
+
+        base = int(ep["dataset_from_index"])
+        out: dict[str, torch.Tensor] = {}
+        for key, query_ts in query_timestamps.items():
+            rows = [base + int(round(ts * self._meta.fps)) for ts in query_ts]
+            frames = torch.from_numpy(np.ascontiguousarray(self._frame_cache[key][rows]))
+            frames = frames.permute(0, 3, 1, 2)  # (T, H, W, C) -> (T, C, H, W)
+            if not self._return_uint8:
+                frames = frames.to(torch.float32).div_(255.0)
+            out[key] = frames.squeeze(0)
+        return out
+
     def _query_videos(self, query_timestamps: dict[str, list[float]], ep_idx: int) -> dict[str, torch.Tensor]:
         """Note: When using data workers (e.g. DataLoader with num_workers>0), do not call this function
         in the main process (e.g. by using a second Dataloader with num_workers=0). It will result in a
         Segmentation Fault.
         """
         ep = self._meta.episodes[ep_idx]
+
+        if self._video_backend == "memmap":
+            return self._query_memmap(ep, query_timestamps)
 
         def _decode_single(vid_key: str, query_ts: list[float]) -> tuple[str, torch.Tensor]:
             from_timestamp = ep[f"videos/{vid_key}/from_timestamp"]

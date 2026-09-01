@@ -137,6 +137,11 @@ evaluation (including the fine-tuned IMLE checkpoints in
 [`azorematter/imle_ft_gripperz_dice`](https://huggingface.co/azorematter/imle_ft_gripperz_dice) and ACT in
 [`azorematter/act_dice_white_pnp`](https://huggingface.co/azorematter/act_dice_white_pnp)).
 
+**For training throughput, see [TRAINING_PERFORMANCE.md](./TRAINING_PERFORMANCE.md)** — measured
+profiling of where training time actually goes on A100s, the four levers that moved it (multi-GPU, the
+frame cache, mixed precision, `torch.compile`), the ones that didn't (batch size), and the config traps
+worth knowing before a long run. The same IMLE run went from 11 h 20 m to ~3.8 h.
+
 Intermediate checkpoints are stored every 5k steps under `checkpoints/<step>/`. To use one (repos are private — authenticate with `hf auth login` first):
 
 ```bash
