@@ -155,17 +155,21 @@ class IMLEPolicy(PreTrainedPolicy):
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training or validation."""
+        batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
         if self.config.image_features:
-            batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             for key in self.config.image_features:
                 if self.config.n_obs_steps == 1 and batch[key].ndim == 4:
                     batch[key] = batch[key].unsqueeze(1)
             batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
+        if self.training and self.config.gripper_obs_dropout > 0:
+            batch[OBS_STATE] = _apply_gripper_obs_dropout(batch[OBS_STATE], self.config.gripper_obs_dropout)
         loss, loss_dict = self.imle.compute_loss(batch)
         return loss, loss_dict
 
 
-def _rs_imle_loss(target: Tensor, samples: Tensor, epsilon: float) -> tuple[Tensor, dict]:
+def _rs_imle_loss(
+    target: Tensor, samples: Tensor, epsilon: float, channel_weights: Tensor | None = None
+) -> tuple[Tensor, dict]:
     """Rejection-Sampling IMLE loss.
 
     For each conditioning input, candidates within `epsilon` (L2 over the flattened chunk, in normalized
@@ -175,22 +179,43 @@ def _rs_imle_loss(target: Tensor, samples: Tensor, epsilon: float) -> tuple[Tens
     Args:
         target: (B, horizon, action_dim) ground-truth action chunks.
         samples: (B, n_samples, horizon, action_dim) generated candidate chunks.
+        channel_weights: optional (action_dim,) per-channel weights on the SQUARED error. Applied before
+            the distance is computed, so they reshape candidate selection, the loss gradient, and the
+            epsilon-rejection metric consistently (epsilon then lives in the weighted space).
     Returns:
         A scalar loss (zero, but still attached to the graph, if every candidate was rejected) and a dict of
         detached metrics.
     """
     batch_size, n_samples = samples.shape[:2]
+    grip_scale = 1.0
+    if channel_weights is not None:
+        # sqrt so that the plain L2 below yields sum_d w_d * delta_d^2.
+        scale = channel_weights.to(samples.dtype).to(samples.device).sqrt()
+        grip_scale = float(scale[-1])
+        target = target * scale
+        samples = samples * scale
     distances = torch.cdist(
         target.reshape(batch_size, 1, -1), samples.reshape(batch_size, n_samples, -1)
     ).squeeze(1)  # (B, n_samples)
 
     rejected = distances <= epsilon
-    min_distances, _ = distances.masked_fill(rejected, torch.inf).min(dim=1)
+    masked = distances.masked_fill(rejected, torch.inf)
+    min_distances, min_idx = masked.min(dim=1)
     valid = torch.isfinite(min_distances)
 
     # When all candidates are rejected, contribute a graph-attached zero so the training step stays a
     # no-op without needing special-casing in the trainer.
     loss = min_distances[valid].mean() if valid.any() else samples.sum() * 0.0
+
+    # Gripper diagnostic: mean |error| on the last action channel of the NEAREST candidate
+    # (rejection ignored, so the metric is defined for every batch element on every step). The
+    # scale is divided back out so the value stays in true normalized units and is comparable
+    # across rs_gripper_weight settings. This is the channel the copy-shortcut failure hides in,
+    # so it gets its own line in the logs.
+    nearest_idx = distances.argmin(dim=1)
+    selected = samples[torch.arange(batch_size, device=samples.device), nearest_idx]  # (B, horizon, D)
+    grip_err = (selected[..., -1] - target[..., -1]).abs().mean(dim=1) / grip_scale  # (B,)
+    grip_err_valid = grip_err.mean().item()
 
     loss_dict = {
         "distance_mean": distances.mean().item(),
@@ -198,8 +223,43 @@ def _rs_imle_loss(target: Tensor, samples: Tensor, epsilon: float) -> tuple[Tens
         "distance_max": distances.max().item(),
         "rejection_rate": rejected.float().mean().item(),
         "all_rejected_rate": (~valid).float().mean().item(),
+        "gripper_err_selected": grip_err_valid,
     }
     return loss, loss_dict
+
+
+def _apply_gripper_obs_dropout(state: Tensor, p: float) -> Tensor:
+    """Corrupt the observed gripper channel (LAST state dim) for a random subset of samples.
+
+    With probability `p` per batch element, the gripper column (across the whole observation
+    history) is replaced by the gripper column of another random element in the batch. Drawing the
+    replacement from the batch keeps the corrupted values on the marginal distribution of real
+    gripper observations regardless of the normalization scheme, while destroying the bit's
+    within-sample predictive value — the policy can no longer learn "output what the bit says" and
+    must ground open/close decisions visually.
+
+    A batch of size 1 is returned unchanged (no donor exists), so single-sample debugging runs
+    exercise no corruption.
+
+    Args:
+        state: (B, n_obs_steps, state_dim) normalized observation states.
+        p: per-sample corruption probability.
+    Returns:
+        A corrupted copy (the input tensor is left untouched; at B < 2, the input itself).
+    """
+    batch_size = state.shape[0]
+    if batch_size < 2:
+        # No donor exists; corruption is impossible (e.g. overfit-one-sample debugging).
+        return state
+    mask = torch.rand(batch_size, device=state.device) < p
+    if not mask.any():
+        return state
+    # Offset by 1..B-1 so the donor is never the sample itself.
+    offsets = torch.randint(1, batch_size, (batch_size,), device=state.device)
+    donors = (torch.arange(batch_size, device=state.device) + offsets) % batch_size
+    state = state.clone()
+    state[mask, ..., -1] = state[donors[mask], ..., -1]
+    return state
 
 
 class IMLEModel(nn.Module):
@@ -390,7 +450,12 @@ class IMLEModel(nn.Module):
         samples = self._sample_chunks(repeated_cond)
         samples = samples.reshape(batch_size, n_samples, *samples.shape[1:])
 
-        return _rs_imle_loss(batch[ACTION], samples, self.config.rs_epsilon)
+        channel_weights = None
+        if self.config.rs_gripper_weight != 1.0:
+            channel_weights = torch.ones(self.config.action_feature.shape[0], device=samples.device)
+            channel_weights[-1] = self.config.rs_gripper_weight
+
+        return _rs_imle_loss(batch[ACTION], samples, self.config.rs_epsilon, channel_weights)
 
 
 class SpatialSoftmax(nn.Module):

@@ -136,6 +136,23 @@ class IMLEConfig(PreTrainedConfig):
     # RS-IMLE training.
     n_samples_per_condition: int = 20
     rs_epsilon: float = 0.03
+    # Gripper-transition robustness. Close/open transitions are a tiny fraction of frames, and an
+    # unweighted chunk distance lets the generator treat the gripper channel (conventionally the
+    # LAST action/state dimension) as an afterthought — or worse, copy the observed gripper bit.
+    # `rs_gripper_weight` multiplies the last action dimension's squared error inside the RS-IMLE
+    # distance, affecting candidate selection, the loss, and the epsilon-rejection metric alike.
+    # `transition_oversample` makes every frame whose next `horizon` actions contain a flip of the
+    # last action dimension appear that many times per epoch (integer; 1 disables).
+    # `gripper_obs_dropout` is the per-sample probability, during training only, of replacing the
+    # observed gripper value with one taken from another sample in the batch — destroying the
+    # input bit's predictive value so the policy must ground the transition visually.
+    rs_gripper_weight: float = 1.0
+    transition_oversample: int = 1
+    gripper_obs_dropout: float = 0.0
+    # When > 0, `transition_oversample` also repeats motion-onset frames: the moments where the
+    # action vector changes again after being exactly constant for at least this many consecutive
+    # frames (dwell exits, e.g. descending after a stationary hover). 0 disables onset detection.
+    motion_onset_min_dwell: int = 0
 
     # Inference.
     use_traj_consistency: bool = False
@@ -169,6 +186,18 @@ class IMLEConfig(PreTrainedConfig):
             )
         if self.rs_epsilon < 0:
             raise ValueError(f"`rs_epsilon` must be non-negative. Got {self.rs_epsilon}.")
+        if self.rs_gripper_weight <= 0:
+            raise ValueError(f"`rs_gripper_weight` must be positive. Got {self.rs_gripper_weight}.")
+        if self.transition_oversample < 1:
+            raise ValueError(
+                f"`transition_oversample` must be a positive integer. Got {self.transition_oversample}."
+            )
+        if self.motion_onset_min_dwell < 0:
+            raise ValueError(
+                f"`motion_onset_min_dwell` must be non-negative. Got {self.motion_onset_min_dwell}."
+            )
+        if not (0.0 <= self.gripper_obs_dropout <= 1.0):
+            raise ValueError(f"`gripper_obs_dropout` must be in [0, 1]. Got {self.gripper_obs_dropout}.")
         if self.n_consistency_candidates < 1:
             raise ValueError(
                 f"`n_consistency_candidates` must be a positive integer. Got {self.n_consistency_candidates}."

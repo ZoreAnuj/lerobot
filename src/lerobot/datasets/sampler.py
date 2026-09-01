@@ -179,3 +179,107 @@ def compute_sampler_state(step: int, num_frames: int, batch_size: int, num_proce
     epoch, batches_into_epoch = divmod(step, batches_per_epoch)
     start_index = min(batches_into_epoch * batch_size * num_processes, num_frames)
     return {"epoch": epoch, "start_index": start_index}
+
+
+class TransitionOversampler(EpisodeAwareSampler):
+    """EpisodeAwareSampler whose epochs repeat a chosen set of frames.
+
+    The position space is extended past the base sampler's frames with `repeats - 1` extra copies
+    of each index in `oversample_indices`, and the whole expanded space is shuffled with the same
+    (seed, epoch)-pure permutation as the base class — so per-rank determinism, `state_dict` /
+    `load_state_dict` resume, and `compute_sampler_state` all keep working unchanged.
+
+    Built for rare-event rebalancing (e.g. frames whose action chunk contains a gripper
+    open/close transition), but agnostic to what the indices mean.
+    """
+
+    def __init__(self, *args, oversample_indices=None, repeats: int = 1, **kwargs):
+        super().__init__(*args, **kwargs)
+        if repeats < 1:
+            raise ValueError(f"repeats must be >= 1, got {repeats}")
+        extra = np.asarray(oversample_indices if oversample_indices is not None else [], dtype=np.int64)
+        self._base_num_frames = self._num_frames
+        # Only repeat frames the base sampler can emit: anything else (e.g. a frame inside the
+        # drop_n_last_frames tail, or from a filtered-out episode) was excluded deliberately, and
+        # re-injecting it would hand the model the copy-padded chunks the base sampler avoids.
+        valid = np.fromiter((self._frame_index(k) for k in range(self._base_num_frames)), dtype=np.int64)
+        dropped = len(extra) - int(np.isin(extra, valid).sum())
+        if dropped:
+            logger.info(
+                "TransitionOversampler: %d oversample indices fall outside the base sampler's "
+                "frames (dropped tails or filtered episodes) and are not repeated.",
+                dropped,
+            )
+        extra = extra[np.isin(extra, valid)]
+        self._extra = np.repeat(extra, repeats - 1)
+        self._num_frames = self._base_num_frames + len(self._extra)
+
+    def _frame_index(self, position: int) -> int:
+        if position < self._base_num_frames:
+            return super()._frame_index(position)
+        return int(self._extra[position - self._base_num_frames])
+
+
+def _mark_windows(marked: np.ndarray, episodes: np.ndarray, rows: np.ndarray, horizon: int, lead: int):
+    """Mark, for each event row, the conditioning frames whose action chunk contains it.
+
+    A frame i's chunk covers rows [i - lead, i - lead + horizon), so the conditioning frames for an
+    event at row j are [j - horizon + 1 + lead, j + lead], clipped to j's episode and array bounds.
+    """
+    for j in rows:
+        lo = max(0, j - horizon + 1 + lead)
+        hi = min(len(marked) - 1, j + lead)
+        while lo < j and episodes[lo] != episodes[j]:
+            lo += 1
+        while hi > j and episodes[hi] != episodes[j]:
+            hi -= 1
+        marked[lo : hi + 1] = True
+
+
+def find_transition_frames(dataset, horizon: int, lead: int = 0, min_dwell: int = 0) -> np.ndarray:
+    """Relative indices of frames whose action chunk contains a gripper flip or a motion onset.
+
+    A "flip" is a change of the thresholded (> 0.5) LAST action channel between consecutive frames
+    of the same episode — conventionally the gripper open/close bit. When `min_dwell` > 0, a
+    "motion onset" is additionally marked: the first row where the action vector changes again
+    after being exactly constant for at least `min_dwell` consecutive frames (the dwell-exit
+    moments that teach a policy to leave a hover). A frame belongs to the window when the event
+    falls inside its `horizon`-step action chunk, which starts `lead` frames in the past
+    (`lead = n_obs_steps - 1` for chunked policies whose action window begins at the oldest
+    observation).
+
+    `dataset` needs only `.hf_dataset` (rows in relative order with "action" and "episode_index"
+    columns), so it works on episode-filtered datasets out of the box. Logs a warning when no
+    event is found — e.g. a dataset whose last action channel is not 0/1-coded.
+    """
+    table = dataset.hf_dataset.data
+    actions = np.asarray(table.column("action").to_pylist(), dtype=np.float32)
+    episodes = np.asarray(table.column("episode_index").to_pylist(), dtype=np.int64)
+    same_ep = episodes[1:] == episodes[:-1]
+
+    grip = actions[:, -1] > 0.5
+    flips = np.flatnonzero((grip[1:] != grip[:-1]) & same_ep) + 1
+
+    marked = np.zeros(len(actions), dtype=bool)
+    _mark_windows(marked, episodes, flips, horizon, lead)
+
+    if min_dwell > 0:
+        still = np.zeros(len(actions), dtype=bool)
+        still[1:] = (np.abs(actions[1:] - actions[:-1]).max(axis=1) == 0.0) & same_ep
+        run = 0
+        onsets = []
+        for i in range(1, len(actions)):
+            if still[i]:
+                run += 1
+            else:
+                if run >= min_dwell and episodes[i] == episodes[i - 1]:
+                    onsets.append(i)
+                run = 0
+        _mark_windows(marked, episodes, np.asarray(onsets, dtype=np.int64), horizon, lead)
+
+    if not marked.any():
+        logger.warning(
+            "find_transition_frames found no gripper flips or motion onsets — is the last action "
+            "channel really a 0/1 gripper bit? Transition oversampling will be a no-op."
+        )
+    return np.flatnonzero(marked)

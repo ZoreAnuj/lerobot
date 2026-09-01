@@ -290,15 +290,42 @@ def make_dataloaders(
         # BatchSamplerShard without needing a `generator` attribute to synchronize an RNG, and
         # resume is sample-exact.
         shuffle = False
-        sampler = EpisodeAwareSampler(
-            dataset.meta.episodes["dataset_from_index"],
-            dataset.meta.episodes["dataset_to_index"],
-            episode_indices_to_use=dataset.episodes,
-            drop_n_last_frames=getattr(active_cfg, "drop_n_last_frames", 0),
-            shuffle=True,
-            seed=cfg.seed if cfg.seed is not None else 0,
-            absolute_to_relative_idx=dataset.absolute_to_relative_idx,
-        )
+        sampler_kwargs = {
+            "episode_indices_to_use": dataset.episodes,
+            "drop_n_last_frames": getattr(active_cfg, "drop_n_last_frames", 0),
+            "shuffle": True,
+            "seed": cfg.seed if cfg.seed is not None else 0,
+            "absolute_to_relative_idx": dataset.absolute_to_relative_idx,
+        }
+        oversample = int(getattr(active_cfg, "transition_oversample", 1) or 1)
+        if oversample > 1:
+            from lerobot.datasets.sampler import TransitionOversampler, find_transition_frames
+
+            transition_frames = find_transition_frames(
+                dataset,
+                horizon=getattr(active_cfg, "horizon", 1),
+                lead=getattr(active_cfg, "n_obs_steps", 1) - 1,
+                min_dwell=int(getattr(active_cfg, "motion_onset_min_dwell", 0) or 0),
+            )
+            sampler = TransitionOversampler(
+                dataset.meta.episodes["dataset_from_index"],
+                dataset.meta.episodes["dataset_to_index"],
+                oversample_indices=transition_frames,
+                repeats=oversample,
+                **sampler_kwargs,
+            )
+            if is_main_process():
+                logging.info(
+                    f"Transition oversampling: {len(transition_frames)} transition-window frames "
+                    f"repeated x{oversample} ({len(sampler)} samples/epoch vs "
+                    f"{dataset.num_frames} frames)"
+                )
+        else:
+            sampler = EpisodeAwareSampler(
+                dataset.meta.episodes["dataset_from_index"],
+                dataset.meta.episodes["dataset_to_index"],
+                **sampler_kwargs,
+            )
         if cfg.resume and step > 0:
             # The resume offset depends on the (dp_world_size, batch_size) that produced `step`,
             # so use the values recorded in the checkpoint (falling back to the current ones for

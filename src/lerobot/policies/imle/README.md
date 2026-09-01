@@ -25,6 +25,28 @@ At inference, one forward pass yields the chunk. For strongly multimodal tasks, 
 batch and executes the one whose start best matches the tail of the previously executed chunk, avoiding
 mode switching between replans.
 
+## Gripper-transition robustness
+
+Binary gripper transitions are a tiny fraction of frames (often <1%), and with an unweighted chunk
+distance the loss-cheapest strategy for the gripper channel is to copy the observed gripper bit —
+which deadlocks at deployment when the observed bit is rebuilt from the policy's own last command.
+Three flags counter this (the gripper is assumed to be the LAST state/action dimension):
+
+```bash
+lerobot-train --policy.type=imle \
+  --policy.rs_gripper_weight=5.0 \      # weight the gripper channel inside the IMLE distance
+  --policy.transition_oversample=10 \   # transition-window frames appear 10x per epoch
+  --policy.gripper_obs_dropout=0.2 \    # randomly swap the observed gripper bit between samples
+  ...
+```
+
+`rs_gripper_weight` reshapes candidate selection, the loss, and the epsilon-rejection metric
+consistently. `transition_oversample` rebalances sampling toward chunks that contain a flip.
+`gripper_obs_dropout` destroys the input bit's predictive value so open/close must be grounded
+visually. Watch `gripper_err_selected` in the training logs — plain loss and step-level gripper
+accuracy provably cannot see the copy-shortcut failure (a copy baseline scores ~99%); evaluate
+transition recall (does the policy flip the gripper near demonstrated transitions?) instead.
+
 ## Training
 
 The reference implementation maintains an exponential moving average (EMA) of the policy weights during
