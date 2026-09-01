@@ -131,6 +131,12 @@ Checkpoints for the IMLE and SmolVLA policies trained on [`azorematter/dice_whit
 | 2 | `checkpoints/100000/pretrained_model` | 0.054° | 99.5% | `checkpoints/025000/pretrained_model` | 0.170° | 99.5% |
 | 3 | `checkpoints/080000/pretrained_model_ema` | 0.055° | 99.8% | `checkpoints/020000/pretrained_model` | 0.221° | 99.4% |
 
+**For deployment, see [INFERENCE.md](./INFERENCE.md)** — the full observation/action contract these
+checkpoints expect, working inference code, and the deployment pitfalls found during real-robot
+evaluation (including the fine-tuned IMLE checkpoints in
+[`azorematter/imle_ft_gripperz_dice`](https://huggingface.co/azorematter/imle_ft_gripperz_dice) and ACT in
+[`azorematter/act_dice_white_pnp`](https://huggingface.co/azorematter/act_dice_white_pnp)).
+
 Intermediate checkpoints are stored every 5k steps under `checkpoints/<step>/`. To use one (repos are private — authenticate with `hf auth login` first):
 
 ```bash
