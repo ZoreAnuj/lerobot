@@ -37,17 +37,124 @@ Metric definitions:
 - **dwell escape** — from a stationary hover, does the chunk command motion? **Higher is better**, but
   see the caveat in §6: it is meaningless for undertrained checkpoints.
 
-## 2. Observation contract (identical for all four policies)
+## 2. Inputs and resolution — the full specification
 
-| property | value |
-| --- | --- |
-| Cameras | `observation.images.gripper` (wrist), `observation.images.cam0` (elevated board view) |
-| Frame format | 480×640, **RGB** (convert from BGR), channel-first `(3, 480, 640)`, `float32` in `[0, 1]` |
-| Resolution handling | Feed **full 480×640**. IMLE resizes to 240×320 *inside* the model (`resize_shape=[240,320]`, no crop). Do not resize or crop outside. |
-| State `observation.state` | 7-dim `float32`: `[J1, J2, J3, J4, J5, J6, gripper]` — joints in **absolute degrees**, gripper **1.0 = OPEN, 0.0 = CLOSED** |
-| Rate | 30 Hz (33.3 ms spacing is what the policies saw) |
-| History | **IMLE: 2 observation steps, 33 ms apart** (see §4.1). **ACT: 1 step.** |
-| Normalization | Loaded from the checkpoint — see the warning in §3 |
+Get this section exactly right and the policies perform as measured; deviate and they degrade in ways
+that look like bad weights. Everything here was read out of the trained checkpoints and the model code,
+not from memory.
+
+### 2.1 The two required keys
+
+| key | shape | dtype | range | meaning |
+| --- | --- | --- | --- | --- |
+| `observation.images.gripper` | `(B, 3, 480, 640)` | `float32` | `[0.0, 1.0]` | wrist camera, **RGB**, channel-first |
+| `observation.images.cam0` | `(B, 3, 480, 640)` | `float32` | `[0.0, 1.0]` | elevated board view, **RGB**, channel-first |
+| `observation.state` | `(B, 7)` | `float32` | raw units | `[J1, J2, J3, J4, J5, J6, gripper]` |
+
+For IMLE with explicit history the image keys are `(B, 2, 3, 480, 640)` and state is `(B, 2, 7)` (§4.1).
+No other keys are needed — these policies are **not** language-conditioned, so unlike SmolVLA there is
+no `task` string to pass.
+
+**State units, exactly:**
+
+- `J1…J6` — **absolute joint angles in degrees**, as the controller reports them. Not radians, not
+  deltas, not Cartesian. Approximate ranges seen in training: J1 43…93, J2 −28…21, J3 −52…19,
+  J4 −19…37, J5 −86…−21, J6 −122…−16.
+- `gripper` — **1.0 = OPEN, 0.0 = CLOSED**. This polarity is easy to invert by accident and the policy
+  gives no obvious sign of it; a flipped bit is one of the failure modes in §6.
+
+**Image format, exactly:**
+
+- **RGB, not BGR.** OpenCV gives you BGR — convert it. A swapped channel order silently costs accuracy
+  because the encoders were trained on ImageNet-initialised weights and dataset RGB statistics.
+- **Channel-first** `(3, H, W)`, not `(H, W, 3)`.
+- **`float32` scaled to `[0, 1]`** — divide `uint8` by 255. Do not pass `uint8`, and do not
+  pre-apply ImageNet mean/std: normalization happens inside the pipeline (§2.4).
+
+### 2.2 Resolution — feed native 480×640, and why it differs per policy
+
+**Feed full 480×640 to both policies. Never resize or crop outside the model.** What happens inside
+differs, which matters if you are tempted to "help" by downscaling:
+
+| | RS-IMLE | ACT |
+| --- | --- | --- |
+| `resize_shape` | `[240, 320]` | **none — consumes native resolution** |
+| `crop_shape` | `None` (no crop) | none |
+| Internal resize | `torchvision.transforms.Resize([240,320])`, **bilinear, antialias=True** | — |
+| Resolution the ResNet18 sees | **240×320** | **480×640** |
+| `layer4` feature map | `512 × 8 × 10` | `512 × 15 × 20` |
+| Encoder count per sample | 4 (2 cameras × 2 obs steps, separate encoder per camera) | 2 (2 cameras × 1 step) |
+
+Consequences to respect:
+
+- **ACT has no resize step at all.** Hand it anything other than 480×640 and its feature map changes
+  shape (a 240×320 input yields 8×10 instead of 15×20), which silently changes the spatial resolution
+  its transformer attends over. It may not even error — it will just be wrong.
+- **IMLE will accept other sizes** because it resizes internally, but the *field of view and aspect
+  ratio* must still match collection. Downscaling before you pass it means resizing twice (yours, then
+  the model's bilinear pass), which throws away detail the wrist view needs for fine alignment.
+- **Do not letterbox or pad.** Neither policy expects it (that is a SmolVLA behaviour).
+- **Aspect ratio is fixed at 4:3.** Cropping to a different aspect changes the geometry the policy
+  learned to map onto joint angles.
+
+### 2.3 Timing and history
+
+| | RS-IMLE | ACT |
+| --- | --- | --- |
+| `n_obs_steps` | **2** | **1** |
+| Spacing between the two steps | **33.3 ms** (one frame at 30 Hz) | — |
+| `horizon` / `chunk_size` | 16 | 30 |
+| `n_action_steps` executed per replan | 8 (0.27 s) | 30 (1.0 s) |
+
+The 30 Hz observation rate is not incidental: it is the spacing the policies saw, and IMLE's two-frame
+pair encodes **velocity**. A pair of frames 100 ms apart reads as faster motion than anything in
+training; a duplicated frame reads as stationary (see §4.1 and §6.2).
+
+### 2.4 Normalization — do not do it yourself
+
+The preprocessor pipeline is **rename → add batch dim → to device → normalize**, built from the
+checkpoint's own statistics. The output pipeline is **unnormalize → to CPU**, so the actions you get
+back are already in real units (degrees).
+
+The two policies use **different normalization modes**, which is precisely why you must load the
+processors from the checkpoint rather than reconstruct them:
+
+| feature | RS-IMLE | ACT |
+| --- | --- | --- |
+| `VISUAL` | MEAN_STD | MEAN_STD |
+| `STATE` | **MIN_MAX** → scaled to `[-1, 1]` | **MEAN_STD** → zero mean, unit variance |
+| `ACTION` | **MIN_MAX** | **MEAN_STD** |
+
+Feed raw degrees and raw `[0,1]` images; the pipeline handles the rest. Feeding pre-normalized values
+double-normalizes them and the policy will behave as if the arm is somewhere it is not.
+
+### 2.5 Image chain and camera identity
+
+- **Match the capture pipeline.** Training frames passed through **AV1, CRF 30, yuv420p** video
+  encoding, so they carry that codec's texture-level artifacts. Frames straight from the sensor are
+  *cleaner* than training data, which is still a domain shift. If behaviour looks off with raw frames,
+  A/B an AV1 round-trip offline before suspecting the weights.
+- **Camera assignment is not interchangeable.** `gripper` must be the wrist-mounted view and `cam0` the
+  elevated board view. Swapping them is catastrophic and produces confident nonsense. Verify by serial
+  number, not by enumeration order, which can change across reboots.
+- **Mounting and intrinsics must match collection.** These are 2D-image policies with no calibration
+  input; a moved or re-lensed camera is out-of-distribution.
+- **Gate on frame freshness.** A wedged feed yields a confident policy driving on a still image. Assert
+  both streams advanced since the last tick, and assert the `(3, 480, 640)` shape on every frame rather
+  than trusting the driver.
+
+### 2.6 Minimum viable checklist
+
+Before an armed run, assert all of these — each one has bitten us:
+
+- [ ] images are **RGB**, channel-first, `float32` in `[0,1]`, shape exactly `(3, 480, 640)`
+- [ ] `gripper` camera is the **wrist**, `cam0` is the **overhead**, verified by serial
+- [ ] state is `[J1..J6 degrees, gripper]` with **1.0 = OPEN**
+- [ ] no resizing, cropping, letterboxing or normalization applied outside the model
+- [ ] observations arrive at **30 Hz**; for IMLE the two history frames are **real** and 33 ms apart
+- [ ] processors loaded **from the checkpoint folder** (§3), not rebuilt
+- [ ] both camera streams verified fresh this tick
+- [ ] gripper command thresholded with hysteresis (close < 0.4, open > 0.6), not a single 0.5 cut
 
 ## 3. Loading a checkpoint — read this first
 
@@ -194,9 +301,12 @@ applied from cold start they cost precision and buy nothing.
    (17.4 % of frames repeat the previous action), so "currently stationary" biases every policy toward
    "stay". Replan *while the arm is still moving*, or build the pair from the last two in-motion frames.
    RS-IMLE's dwell escape (0.25) is materially worse than ACT's (0.72) here.
-3. **Camera health is asymmetric.** Blanking the wrist view costs ACT ~4.5× its baseline error but IMLE
-   only ~1.1×; blanking the overhead view costs both far less. ACT depends heavily on the wrist camera —
-   gate armed runs on that feed's freshness and exposure.
+3. **Camera health is asymmetric — and ACT is the fragile one.** Measured by blanking one camera to
+   mid-grey and re-scoring: losing the **wrist** view multiplies ACT's error ~4.5× but IMLE's only
+   ~1.1×; losing the **overhead** view costs both far less (~0.6–1.3×). So ACT carries most of its
+   alignment information in the wrist view. Practical upshot: if the wrist camera can be occluded by
+   the workpiece or the gripper itself in your cell, prefer IMLE, and gate armed runs on that feed's
+   freshness and exposure either way (§2.5).
 4. **Match the image chain.** Training frames passed through AV1 (CRF 30) video encoding. Prefer the
    same camera pipeline used for collection; if feeding raw frames and behaviour looks off, A/B an AV1
    round-trip offline — texture-level domain shift is real.
