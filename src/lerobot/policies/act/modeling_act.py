@@ -66,6 +66,10 @@ class ACTPolicy(PreTrainedPolicy):
 
         self.model = ACT(config)
 
+        if config.compile_model:
+            torch.set_float32_matmul_precision("high")
+            self.model = torch.compile(self.model, mode=config.compile_mode)
+
         if config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler = ACTTemporalEnsembler(config.temporal_ensemble_coeff, config.chunk_size)
 

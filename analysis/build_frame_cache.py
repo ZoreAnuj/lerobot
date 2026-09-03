@@ -29,7 +29,13 @@ H, W = info["features"][KEYS[0]]["shape"][:2]
 if H == 3:                                    # channel-first declaration
     H, W = info["features"][KEYS[0]]["shape"][1:3]
 N = info["total_frames"]
-ep_meta = pq.read_table(f"{ROOT}/meta/episodes/chunk-000/file-000.parquet").to_pandas()
+import glob as _glob
+_ep_files = sorted(_glob.glob(f"{ROOT}/meta/episodes/*/*.parquet"))
+assert _ep_files, f"no episodes parquet under {ROOT}/meta/episodes"
+import pyarrow as _pa
+ep_meta = _pa.concat_tables([pq.read_table(f) for f in _ep_files]).to_pandas()
+assert len(ep_meta) == info["total_episodes"], (
+    f"episode metadata is short: {len(ep_meta)} rows vs info.json {info['total_episodes']}")
 
 os.makedirs(CACHE, exist_ok=True)
 print(f"cache: {len(KEYS)} cameras x {N} frames x {H}x{W}x3 = "

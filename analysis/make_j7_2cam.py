@@ -24,7 +24,11 @@ os.makedirs(f"{DST}/data/chunk-000", exist_ok=True)
 os.makedirs(f"{DST}/meta/episodes/chunk-000", exist_ok=True)
 
 # ---- data
-t = pq.read_table(f"{SRC}/data/chunk-000/file-000.parquet")
+import glob
+data_files = sorted(glob.glob(f"{SRC}/data/*/*.parquet"))
+assert data_files, f"no data parquet under {SRC}/data"
+t = pa.concat_tables([pq.read_table(f) for f in data_files])
+print(f"  read {len(data_files)} data file(s): {len(t)} rows")
 s = np.stack(t["observation.state"].to_numpy(zero_copy_only=False)).astype(np.float32)[:, DIMS]
 a = np.stack(t["action"].to_numpy(zero_copy_only=False)).astype(np.float32)[:, DIMS]
 tab = pa.table({
@@ -64,7 +68,10 @@ for k in ("observation.state", "action"):
              for sk, v in st[k].items()}
 json.dump(st, open(f"{DST}/meta/stats.json", "w"))
 
-ep = pq.read_table(f"{SRC}/meta/episodes/chunk-000/file-000.parquet").to_pandas()
+ep_files = sorted(glob.glob(f"{SRC}/meta/episodes/*/*.parquet"))
+assert ep_files, f"no episodes parquet under {SRC}/meta/episodes"
+ep = pa.concat_tables([pq.read_table(f) for f in ep_files]).to_pandas()
+print(f"  read {len(ep_files)} episode-meta file(s): {len(ep)} episodes")
 drop = [c for c in ep.columns if any(c.startswith(f"videos/{d}/") or c.startswith(f"stats/{d}/")
                                      for d in DROP_CAMS)]
 ep = ep.drop(columns=drop)
@@ -74,5 +81,9 @@ for c in ep.columns:
 pq.write_table(pa.Table.from_pandas(ep, preserve_index=False),
                f"{DST}/meta/episodes/chunk-000/file-000.parquet")
 
+assert len(tab) == info["total_frames"], (
+    f"TRUNCATED: built {len(tab)} frames but info.json says {info['total_frames']}")
+assert len(ep) == info["total_episodes"], (
+    f"TRUNCATED: built {len(ep)} episodes but info.json says {info['total_episodes']}")
 print(f"{DST}: {len(tab)} frames, {len(ep)} episodes, state/action dim {len(DIMS)}, "
       f"cameras {[c.split('.')[-1] for c in KEEP_CAMS]}")

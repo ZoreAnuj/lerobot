@@ -137,6 +137,11 @@ evaluation (including the fine-tuned IMLE checkpoints in
 [`azorematter/imle_ft_gripperz_dice`](https://huggingface.co/azorematter/imle_ft_gripperz_dice) and ACT in
 [`azorematter/act_dice_white_pnp`](https://huggingface.co/azorematter/act_dice_white_pnp)).
 
+**For the current policies, see [INFERENCE_STREAM.md](./INFERENCE_STREAM.md)** — deployment guide for
+the four policies trained on the `dice_white_pnp_stream_100` recording (RS-IMLE, ACT, and two gripper
+variants), with held-out evaluation numbers, per-policy checkpoint picks, and the measured failure
+modes. Those supersede the checkpoints in INFERENCE.md, which were trained on data with a timing defect.
+
 **For training throughput, see [TRAINING_PERFORMANCE.md](./TRAINING_PERFORMANCE.md)** — measured
 profiling of where training time actually goes on A100s, the four levers that moved it (multi-GPU, the
 frame cache, mixed precision, `torch.compile`), the ones that didn't (batch size), and the config traps

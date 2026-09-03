@@ -19,6 +19,18 @@ runs and checkpoints are constants at the top of each file — edit them for you
 | --- | --- |
 | `build_frame_cache.py` | pre-decodes a dataset's videos into a uint8 memmap for `--dataset.video_backend=memmap`, then verifies a sample byte-for-byte against the video decoder |
 
+## Evaluation
+
+Loss cannot rank these policies — a model that just copies the observed gripper bit still scores ~99%
+step accuracy — so ranking uses behaviour probes.
+
+| script | purpose |
+| --- | --- |
+| `rank_imle_ckpts.py` | ranks checkpoints on open-loop MAE plus four behaviour probes: transition recall, commit, gripper bit-flip dependence, dwell escape |
+
+Run it over old and new checkpoints in the same invocation style: the probe thresholds are part of the
+measurement, so numbers are only comparable when every checkpoint went through this same script.
+
 ## Dataset surgery (`dice_white_pnp_100` → `dice_white_pnp_nodip`)
 
 Run in this order:
