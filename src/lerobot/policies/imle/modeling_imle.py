@@ -161,6 +161,8 @@ class IMLEPolicy(PreTrainedPolicy):
                 if self.config.n_obs_steps == 1 and batch[key].ndim == 4:
                     batch[key] = batch[key].unsqueeze(1)
             batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
+        if self.config.obs_repeat_p > 0 and self.config.n_obs_steps > 1:
+            batch = _apply_obs_repeat(batch, self.config.obs_repeat_p)
         if self.training and self.config.gripper_obs_dropout > 0:
             batch[OBS_STATE] = _apply_gripper_obs_dropout(batch[OBS_STATE], self.config.gripper_obs_dropout)
         loss, loss_dict = self.imle.compute_loss(batch)
@@ -262,6 +264,35 @@ def _apply_gripper_obs_dropout(state: Tensor, p: float) -> Tensor:
     return state
 
 
+def _apply_obs_repeat(batch: dict[str, Tensor], p: float) -> dict[str, Tensor]:
+    """Overwrite a random subset of samples' observation history with their newest step.
+
+    For each selected sample, every observation key with a history axis (state, stacked images,
+    env state) gets steps [0, S-2] replaced by a copy of step S-1. The action target is untouched.
+    The result is the zero-velocity observation pair a stop-and-go transport produces at every
+    chunk seam, paired with the motion the demonstrator actually performed next - so a stationary
+    pair stops being a reliable "dwell" signal and the decision has to come from the image content.
+
+    Args:
+        batch: training batch; tensors shaped (B, S, ...) for the observation keys.
+        p: per-sample probability.
+    Returns:
+        A shallow-copied batch with fresh tensors for the modified keys (inputs are left untouched).
+    """
+    state = batch[OBS_STATE]
+    mask = torch.rand(state.shape[0], device=state.device) < p
+    if not mask.any():
+        return batch
+    out = dict(batch)
+    for key in (OBS_STATE, OBS_IMAGES, OBS_ENV_STATE):
+        if key not in out or out[key].ndim < 3:
+            continue
+        x = out[key].clone()
+        x[mask, :-1] = x[mask, -1:]
+        out[key] = x
+    return out
+
+
 class IMLEModel(nn.Module):
     def __init__(self, config: IMLEConfig):
         super().__init__()
@@ -280,6 +311,29 @@ class IMLEModel(nn.Module):
                 global_cond_dim += self.rgb_encoder.feature_dim * num_images
         if self.config.env_state_feature:
             global_cond_dim += self.config.env_state_feature.shape[0]
+
+        # Feature-level camera dropout (see `camera_feature_dropout`). One learned "camera absent"
+        # code per droppable camera: absence must be a distinct input, not a zero vector that
+        # collides with a genuine SpatialSoftmax keypoint at the image centre.
+        self._drop_cam_idx: list[int] = []
+        self.absent_features: nn.ParameterDict | None = None
+        if config.camera_feature_dropout > 0:
+            keys = list(self.config.image_features)
+            missing = [k for k in config.camera_feature_dropout_keys if k not in keys]
+            if missing:
+                raise ValueError(
+                    f"`camera_feature_dropout_keys` {missing} are not image features of this policy "
+                    f"(have {keys})."
+                )
+            self._drop_cam_idx = sorted({keys.index(k) for k in config.camera_feature_dropout_keys})
+            if len(set(self._drop_cam_idx)) >= len(keys):
+                raise ValueError("`camera_feature_dropout_keys` must leave at least one camera undroppable.")
+            encoder0 = (
+                self.rgb_encoder[0] if isinstance(self.rgb_encoder, nn.ModuleList) else self.rgb_encoder
+            )
+            self.absent_features = nn.ParameterDict(
+                {str(i): nn.Parameter(torch.zeros(encoder0.feature_dim)) for i in self._drop_cam_idx}
+            )
 
         self.unet = IMLEConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
 
@@ -358,36 +412,57 @@ class IMLEModel(nn.Module):
 
         return chunks
 
+    def _drop_camera_features(
+        self, per_camera: list[Tensor], batch_size: int, n_obs_steps: int
+    ) -> list[Tensor]:
+        """Training-time camera dropout at the feature level (see `camera_feature_dropout`).
+
+        Args:
+            per_camera: one (B*S, F) feature tensor per camera, rows ordered batch-major then step.
+        Returns:
+            The same list with droppable cameras' rows replaced by their "absent" code for the
+            selected samples - all S steps of a sample together, since a camera that is gone is gone
+            for the whole history.
+        """
+        p = self.config.camera_feature_dropout
+        if not (self.training and p > 0 and self._drop_cam_idx):
+            return per_camera
+        out = list(per_camera)
+        for i in self._drop_cam_idx:
+            mask = torch.rand(batch_size, device=out[i].device) < p
+            if not mask.any():
+                # Under DDP with find_unused_parameters=False every parameter must take part in
+                # every step, so a batch that happened to draw no dropout still uses the code once.
+                mask[0] = True
+            mask = mask.repeat_interleave(n_obs_steps)  # (B*S,) - matches the "(b s)" row order
+            absent = self.absent_features[str(i)].to(out[i].dtype)
+            out[i] = torch.where(mask[:, None], absent.expand_as(out[i]), out[i])
+        return out
+
     def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
         """Encode image features and concatenate them all together along with the state vector."""
         batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
         global_cond_feats = [batch[OBS_STATE]]
-        # Extract image features.
+        # Extract image features, one (B*S, F) tensor per camera so camera dropout can act per view.
         if self.config.image_features:
+            # Combine batch and sequence dims while rearranging to make the camera index dimension first.
+            images_per_camera = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> n (b s) ...")
             if self.config.use_separate_rgb_encoder_per_camera:
-                # Combine batch and sequence dims while rearranging to make the camera index dimension first.
-                images_per_camera = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> n (b s) ...")
-                img_features_list = torch.cat(
-                    [
-                        encoder(images)
-                        for encoder, images in zip(self.rgb_encoder, images_per_camera, strict=True)
-                    ]
-                )
-                # Separate batch and sequence dims back out. The camera index dim gets absorbed into the
-                # feature dim (effectively concatenating the camera features).
-                img_features = einops.rearrange(
-                    img_features_list, "(n b s) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
-                )
+                per_camera = [
+                    encoder(images)
+                    for encoder, images in zip(self.rgb_encoder, images_per_camera, strict=True)
+                ]
             else:
-                # Combine batch, sequence, and "which camera" dims before passing to shared encoder.
-                img_features = self.rgb_encoder(
-                    einops.rearrange(batch[OBS_IMAGES], "b s n ... -> (b s n) ...")
-                )
-                # Separate batch dim and sequence dim back out. The camera index dim gets absorbed into the
-                # feature dim (effectively concatenating the camera features).
-                img_features = einops.rearrange(
-                    img_features, "(b s n) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
-                )
+                # One pass of the shared encoder over every image, then split back per camera.
+                n_cameras = images_per_camera.shape[0]
+                flat = self.rgb_encoder(einops.rearrange(images_per_camera, "n bs ... -> (n bs) ..."))
+                per_camera = list(flat.reshape(n_cameras, batch_size * n_obs_steps, -1))
+            per_camera = self._drop_camera_features(per_camera, batch_size, n_obs_steps)
+            # Separate batch and sequence dims back out. The camera index dim gets absorbed into the
+            # feature dim (effectively concatenating the camera features, in camera order).
+            img_features = einops.rearrange(
+                torch.stack(per_camera), "n (b s) f -> b s (n f)", b=batch_size, s=n_obs_steps
+            )
             global_cond_feats.append(img_features)
 
         if self.config.env_state_feature:

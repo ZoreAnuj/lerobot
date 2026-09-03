@@ -153,6 +153,22 @@ class IMLEConfig(PreTrainedConfig):
     # action vector changes again after being exactly constant for at least this many consecutive
     # frames (dwell exits, e.g. descending after a stationary hover). 0 disables onset detection.
     motion_onset_min_dwell: int = 0
+    # Wrist-camera reliance. Both are TRAINING-ONLY corruptions of the observation, so the deployed
+    # policy still sees every camera and a real history; they only change what the network is allowed
+    # to lean on while it learns.
+    # `camera_feature_dropout` is the per-sample probability of replacing a droppable camera's encoded
+    # features - for every observation step of that sample - with a learned "camera absent" vector.
+    # `camera_feature_dropout_keys` names the droppable cameras (the global view, typically); at least
+    # one camera must stay undroppable. With the global view unreliable, fine alignment has to be
+    # carried by the cameras that are always there - the wrist.
+    camera_feature_dropout: float = 0.0
+    camera_feature_dropout_keys: tuple[str, ...] = ()
+    # `obs_repeat_p` is the per-sample probability of overwriting the older observation steps (state
+    # AND images) with a copy of the newest one, keeping the target chunk. This is exactly the
+    # observation a stop-and-go transport hands the policy at every chunk seam: arm at rest, zero
+    # velocity between the two steps. In the corpus such a pair only ever occurs during a dwell, so
+    # without this the policy learns "stationary pair -> stay" and freezes at the first replan.
+    obs_repeat_p: float = 0.0
 
     # Inference.
     use_traj_consistency: bool = False
@@ -204,6 +220,22 @@ class IMLEConfig(PreTrainedConfig):
             )
         if not (0.0 <= self.gripper_obs_dropout <= 1.0):
             raise ValueError(f"`gripper_obs_dropout` must be in [0, 1]. Got {self.gripper_obs_dropout}.")
+        if not (0.0 <= self.camera_feature_dropout <= 1.0):
+            raise ValueError(
+                f"`camera_feature_dropout` must be in [0, 1]. Got {self.camera_feature_dropout}."
+            )
+        if self.camera_feature_dropout > 0 and not self.camera_feature_dropout_keys:
+            raise ValueError(
+                "`camera_feature_dropout` > 0 requires `camera_feature_dropout_keys` to name the "
+                "droppable camera(s), e.g. ('observation.images.cam0',)."
+            )
+        if len(set(self.camera_feature_dropout_keys)) != len(self.camera_feature_dropout_keys):
+            raise ValueError(
+                f"`camera_feature_dropout_keys` has duplicates: {self.camera_feature_dropout_keys} - a repeated "
+                "key would be dropped twice and raise its effective rate above `camera_feature_dropout`."
+            )
+        if not (0.0 <= self.obs_repeat_p <= 1.0):
+            raise ValueError(f"`obs_repeat_p` must be in [0, 1]. Got {self.obs_repeat_p}.")
         if self.n_consistency_candidates < 1:
             raise ValueError(
                 f"`n_consistency_candidates` must be a positive integer. Got {self.n_consistency_candidates}."

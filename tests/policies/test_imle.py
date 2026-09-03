@@ -454,3 +454,161 @@ class TestReviewGaps:
         idx = find_transition_frames(ds, horizon=4, lead=1, min_dwell=5)
         # Window for onset j=9, horizon=4, lead=1: [9-4+1+1, 9+1] = [7, 10].
         assert idx.tolist() == [7, 8, 9, 10]
+
+
+class TestWristReliance:
+    """Camera feature dropout and replan-at-rest observation repeat (training-only corruptions)."""
+
+    CAM0 = "observation.images.cam0"
+    WRIST = "observation.images.gripper"
+
+    def make_two_cam_config(self, **overrides):
+        config = make_config(**overrides)
+        config.input_features = {
+            OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(4,)),
+            self.WRIST: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 64, 64)),
+            self.CAM0: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 64, 64)),
+        }
+        return config
+
+    def make_two_cam_batch(self, config, batch_size=4):
+        return {
+            OBS_STATE: torch.randn(batch_size, config.n_obs_steps, 4),
+            self.WRIST: torch.rand(batch_size, config.n_obs_steps, 3, 64, 64),
+            self.CAM0: torch.rand(batch_size, config.n_obs_steps, 3, 64, 64),
+            ACTION: torch.randn(batch_size, config.horizon, 2),
+        }
+
+    def test_config_validation(self):
+        with pytest.raises(ValueError, match="camera_feature_dropout_keys"):
+            make_config(camera_feature_dropout=0.3)
+        with pytest.raises(ValueError, match="camera_feature_dropout"):
+            make_config(camera_feature_dropout=1.5, camera_feature_dropout_keys=(self.CAM0,))
+        with pytest.raises(ValueError, match="obs_repeat_p"):
+            make_config(obs_repeat_p=-0.1)
+        # Unknown key and "every camera droppable" are caught when the model is built.
+        cfg = self.make_two_cam_config(camera_feature_dropout=0.3, camera_feature_dropout_keys=("nope",))
+        with pytest.raises(ValueError, match="not image features"):
+            IMLEPolicy(cfg)
+        cfg = self.make_two_cam_config(
+            camera_feature_dropout=0.3, camera_feature_dropout_keys=(self.WRIST, self.CAM0)
+        )
+        with pytest.raises(ValueError, match="undroppable"):
+            IMLEPolicy(cfg)
+
+    def test_drop_camera_features_replaces_only_droppable_camera_for_whole_history(self):
+        torch.manual_seed(0)
+        cfg = self.make_two_cam_config(camera_feature_dropout=1.0, camera_feature_dropout_keys=(self.CAM0,))
+        policy = IMLEPolicy(cfg)
+        policy.train()
+        model = policy.imle
+        assert model._drop_cam_idx == [1]  # cam0 is the second image feature
+        feat_dim = model.absent_features["1"].numel()
+        b, s = 5, cfg.n_obs_steps
+        wrist = torch.randn(b * s, feat_dim)
+        cam0 = torch.randn(b * s, feat_dim)
+        out = model._drop_camera_features([wrist, cam0], b, s)
+        torch.testing.assert_close(out[0], wrist)  # never dropped
+        torch.testing.assert_close(out[1], model.absent_features["1"].detach().expand_as(cam0))
+
+        # p=0 and eval mode are both inert.
+        cfg0 = self.make_two_cam_config(camera_feature_dropout=0.0)
+        assert IMLEPolicy(cfg0).imle._drop_camera_features([wrist, cam0], b, s)[1] is cam0
+        policy.eval()
+        assert model._drop_camera_features([wrist, cam0], b, s)[1] is cam0
+
+    def test_drop_camera_features_mask_is_per_sample_not_per_step(self):
+        torch.manual_seed(3)
+        cfg = self.make_two_cam_config(camera_feature_dropout=0.5, camera_feature_dropout_keys=(self.CAM0,))
+        model = IMLEPolicy(cfg).imle
+        model.train()
+        b, s, f = 64, cfg.n_obs_steps, model.absent_features["1"].numel()
+        cam0 = torch.randn(b * s, f)
+        out = model._drop_camera_features([torch.randn(b * s, f), cam0], b, s)[1]
+        dropped = (out != cam0).any(dim=1).reshape(b, s)  # rows are batch-major then step
+        # Every sample is either fully dropped or fully kept across its steps.
+        assert (dropped.all(dim=1) | (~dropped).any(dim=1) & ~dropped.any(dim=1)).all()
+        assert 0 < dropped[:, 0].float().mean() < 1
+
+    def test_drop_camera_features_always_touches_the_code_under_ddp(self):
+        # With a tiny p the code must still participate once per batch (find_unused_parameters=False).
+        torch.manual_seed(0)
+        cfg = self.make_two_cam_config(camera_feature_dropout=1e-9, camera_feature_dropout_keys=(self.CAM0,))
+        model = IMLEPolicy(cfg).imle
+        model.train()
+        f = model.absent_features["1"].numel()
+        b, s = 8, cfg.n_obs_steps
+        cam0 = torch.randn(b * s, f)
+        out = model._drop_camera_features([torch.randn(b * s, f), cam0], b, s)[1]
+        assert (out[:s] != cam0[:s]).any()  # sample 0 forced
+        torch.testing.assert_close(out[s:], cam0[s:])
+
+    @pytest.mark.parametrize("separate", [True, False])
+    def test_forward_with_camera_dropout_and_obs_repeat(self, separate):
+        cfg = self.make_two_cam_config(
+            camera_feature_dropout=0.5,
+            camera_feature_dropout_keys=(self.CAM0,),
+            obs_repeat_p=0.5,
+            use_separate_rgb_encoder_per_camera=separate,
+        )
+        policy = IMLEPolicy(cfg)
+        policy.train()
+        batch = self.make_two_cam_batch(cfg)
+        state_before = batch[OBS_STATE].clone()
+        loss, _ = policy.forward(batch)
+        assert torch.isfinite(loss)
+        loss.backward()
+        assert policy.imle.absent_features["1"].grad is not None
+        # The caller's tensors are never modified in place.
+        torch.testing.assert_close(batch[OBS_STATE], state_before)
+
+    def test_apply_obs_repeat(self):
+        from lerobot.policies.imle.modeling_imle import _apply_obs_repeat
+        from lerobot.utils.constants import OBS_IMAGES
+
+        torch.manual_seed(0)
+        b, s = 6, 3
+        batch = {
+            OBS_STATE: torch.randn(b, s, 4),
+            OBS_IMAGES: torch.rand(b, s, 2, 3, 8, 8),
+            ACTION: torch.randn(b, 16, 2),
+        }
+        originals = {k: v.clone() for k, v in batch.items()}
+
+        out0 = _apply_obs_repeat(batch, p=0.0)
+        assert out0 is batch
+
+        out1 = _apply_obs_repeat(batch, p=1.0)
+        for key in (OBS_STATE, OBS_IMAGES):
+            newest = out1[key][:, -1:]
+            torch.testing.assert_close(out1[key][:, :-1], newest.expand_as(out1[key][:, :-1]))
+            torch.testing.assert_close(out1[key][:, -1], originals[key][:, -1])  # newest step kept
+            torch.testing.assert_close(batch[key], originals[key])  # input untouched
+        assert out1[ACTION] is batch[ACTION]  # target never touched
+
+    def test_obs_repeat_is_off_in_eval_mode(self):
+        cfg = self.make_two_cam_config(obs_repeat_p=1.0)
+        policy = IMLEPolicy(cfg)
+        policy.eval()
+        batch = self.make_two_cam_batch(cfg)
+        # In eval mode the model consumes the history as given: make the two steps differ and check
+        # the conditioning differs from the repeated-history conditioning.
+        cond_real = policy.imle._prepare_global_conditioning(
+            {**batch, "observation.images": torch.stack([batch[self.WRIST], batch[self.CAM0]], dim=-4)}
+        )
+        from lerobot.policies.imle.modeling_imle import _apply_obs_repeat
+
+        rep = _apply_obs_repeat(
+            {**batch, "observation.images": torch.stack([batch[self.WRIST], batch[self.CAM0]], dim=-4)}, p=1.0
+        )
+        cond_rep = policy.imle._prepare_global_conditioning(rep)
+        assert not torch.allclose(cond_real, cond_rep)
+
+    def test_shared_and_separate_encoder_layouts_agree_on_shape(self):
+        cfg_sep = self.make_two_cam_config(use_separate_rgb_encoder_per_camera=True)
+        cfg_sh = self.make_two_cam_config(use_separate_rgb_encoder_per_camera=False)
+        batch = self.make_two_cam_batch(cfg_sep)
+        stacked = torch.stack([batch[self.WRIST], batch[self.CAM0]], dim=-4)
+        c1 = IMLEPolicy(cfg_sep).imle._prepare_global_conditioning({**batch, "observation.images": stacked})
+        c2 = IMLEPolicy(cfg_sh).imle._prepare_global_conditioning({**batch, "observation.images": stacked})
+        assert c1.shape == c2.shape
